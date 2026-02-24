@@ -1,0 +1,36 @@
+# Build artifacts
+lib/
+vendor/lua-5.3.5/
+*.so
+*.o
+*.pyc
+__pycache__/
+
+# Python
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Data (downloaded separately via scripts/download_data.py)
+data/cards.cdb
+data/script/
+
+# Training artifacts
+checkpoints/
+logs/
+runs/
+*.onnx
+training.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
