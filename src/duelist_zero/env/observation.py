@@ -17,12 +17,17 @@ Layout (OBSERVATION_DIM total):
   [9]     opp banished / 40
   [10-17] phase one-hot (8 phases)
   [18]    turn player flag (1 if my turn)
-  [19-78] my monster zone: 5 slots × 12 features
-  [79-108] my spell/trap zone: 5 slots × 6 features
-  [109-168] opp monster zone: 5 slots × 12 features
-  [169-198] opp spell/trap zone: 5 slots × 6 features
-  [199-278] my hand: 10 slots × 8 features
-  [279-328] recent actions: 10 × 5 features
+  [19]    turn count / 40
+  [20]    LP advantage (my_lp - opp_lp) / 8000, clipped [-1, 1]
+  [21]    monster count advantage / 5, clipped [-1, 1]
+  [22]    total ATK advantage / 10000, clipped [-1, 1]
+  [23-82] my monster zone: 5 slots × 12 features
+  [83-112] my spell/trap zone: 5 slots × 6 features
+  [113-172] opp monster zone: 5 slots × 12 features
+  [173-202] opp spell/trap zone: 5 slots × 6 features
+  [203-282] my hand: 10 slots × 8 features
+  [283-332] recent actions: 10 × 5 features
+  [333-352] deck identity one-hot (20 slots, first 7 = DECK_ORDER)
 """
 
 import sqlite3
@@ -42,6 +47,8 @@ from .card_index import CardIndex
 _SCALAR_DIM = 10          # LP, hand, deck, GY, banished × 2 players
 _PHASE_DIM = 8            # phase one-hot
 _TURN_DIM = 1             # turn player flag
+_GAME_PROGRESS_DIM = 1    # turn count / 40
+_RELATIVE_DIM = 3         # LP advantage, monster count advantage, ATK advantage
 _MONSTER_SLOT_DIM = 12    # features per monster zone slot
 _SPELL_SLOT_DIM = 6       # features per spell/trap zone slot
 _HAND_SLOT_DIM = 8        # features per hand card slot
@@ -52,21 +59,31 @@ _SPELL_ZONE_DIM = 5 * _SPELL_SLOT_DIM        # 30
 _HAND_DIM = 10 * _HAND_SLOT_DIM              # 80
 _ACTION_HIST_TOTAL = 10 * _ACTION_HIST_DIM   # 50
 
+MAX_DECKS = 20                               # capacity for deck identity one-hot
+_DECK_ID_DIM = MAX_DECKS                     # 20
+
 OBSERVATION_DIM = (
     _SCALAR_DIM +
     _PHASE_DIM +
     _TURN_DIM +
+    _GAME_PROGRESS_DIM +
+    _RELATIVE_DIM +
     2 * _MONSTER_ZONE_DIM +   # my + opp
     2 * _SPELL_ZONE_DIM +     # my + opp
     _HAND_DIM +
-    _ACTION_HIST_TOTAL
+    _ACTION_HIST_TOTAL +
+    _DECK_ID_DIM
 )
-# = 10 + 8 + 1 + 120 + 60 + 80 + 50 = 329
+# = 10 + 8 + 1 + 1 + 3 + 120 + 60 + 80 + 50 + 20 = 353
 
-# Card ID observation: 30 slots for embedding lookup
+# Card ID observation: 50 slots for embedding lookup
 # [0-4] my monsters, [5-9] my S/T, [10-14] opp monsters (face-up only),
-# [15-19] opp S/T (face-up only), [20-29] my hand (up to 10)
-CARD_ID_DIM = 30
+# [15-19] opp S/T (face-up only), [20-29] my hand (up to 10),
+# [30-39] my graveyard (top 10), [40-49] opp graveyard (top 10)
+CARD_ID_DIM = 50
+
+# Action-to-card mapping: one card index per action slot
+ACTION_CARD_DIM = 71
 
 
 # Phase index mapping
@@ -220,6 +237,7 @@ def encode_observation(
     state: GameState,
     perspective: int,
     db: Optional[CardDB] = None,
+    deck_id: int = 0,
 ) -> np.ndarray:
     """
     Encode the full game state from `perspective` player's point of view.
@@ -228,6 +246,7 @@ def encode_observation(
         state: Current GameState
         perspective: 0 or 1 — which player is the agent
         db: CardDB for looking up card stats (optional but recommended)
+        deck_id: Index into the deck pool (0 = Goat Control, up to MAX_DECKS-1)
 
     Returns:
         float32 array of shape (OBSERVATION_DIM,)
@@ -256,6 +275,36 @@ def encode_observation(
 
     # --- Turn player ---
     obs[idx] = float(state.turn_player == perspective)
+    idx += 1
+
+    # --- Turn count ---
+    obs[idx] = min(state.current_turn, 40) / 40.0
+    idx += 1
+
+    # --- Relative advantage features ---
+    lp_diff = (me.lp - opp.lp) / 8000.0
+    obs[idx] = max(-1.0, min(1.0, lp_diff))
+    idx += 1
+
+    my_mon_count = sum(1 for m in me.monsters if m is not None)
+    opp_mon_count = sum(1 for m in opp.monsters if m is not None)
+    obs[idx] = max(-1.0, min(1.0, (my_mon_count - opp_mon_count) / 5.0))
+    idx += 1
+
+    # Total ATK of attack-position monsters
+    my_atk = 0.0
+    for m in me.monsters:
+        if m is not None and bool(m.position & POSITION.ATTACK) and db is not None:
+            data = db.get(m.code & 0x7FFFFFFF)
+            if data and data["atk"] >= 0:
+                my_atk += data["atk"]
+    opp_atk = 0.0
+    for m in opp.monsters:
+        if m is not None and bool(m.position & POSITION.FACEUP) and bool(m.position & POSITION.ATTACK) and db is not None:
+            data = db.get(m.code & 0x7FFFFFFF)
+            if data and data["atk"] >= 0:
+                opp_atk += data["atk"]
+    obs[idx] = max(-1.0, min(1.0, (my_atk - opp_atk) / 10000.0))
     idx += 1
 
     # --- My monster zone ---
@@ -296,6 +345,11 @@ def encode_observation(
     for action in recent:
         obs[idx:idx + _ACTION_HIST_DIM] = _encode_action(action)
         idx += _ACTION_HIST_DIM
+
+    # --- Deck identity one-hot ---
+    if 0 <= deck_id < MAX_DECKS:
+        obs[idx + deck_id] = 1.0
+    idx += _DECK_ID_DIM
 
     assert idx == OBSERVATION_DIM, f"Observation dim mismatch: {idx} != {OBSERVATION_DIM}"
     return obs
@@ -355,5 +409,88 @@ def encode_card_ids(
             ids[idx] = float(card_index.code_to_index(hand[i]))
         idx += 1
 
+    # My graveyard (top 10, most recent first — public info)
+    my_gy = me.graveyard[-10:]
+    for i in range(10):
+        if i < len(my_gy) and my_gy[-(i + 1)] != 0:
+            ids[idx] = float(card_index.code_to_index(my_gy[-(i + 1)]))
+        idx += 1
+
+    # Opp graveyard (top 10, most recent first — public info)
+    opp_gy = opp.graveyard[-10:]
+    for i in range(10):
+        if i < len(opp_gy) and opp_gy[-(i + 1)] != 0:
+            ids[idx] = float(card_index.code_to_index(opp_gy[-(i + 1)]))
+        idx += 1
+
     assert idx == CARD_ID_DIM
     return ids
+
+
+# ============================================================
+# Action-to-card mapping encoder
+# ============================================================
+def encode_action_cards(msg, card_index: CardIndex) -> np.ndarray:
+    """
+    Encode which card each action slot refers to.
+
+    Returns float32 array of shape (ACTION_CARD_DIM,) where each element
+    is the card embedding index for the corresponding action. Zero means
+    no card (phase transitions, pass, or unused slots).
+
+    Action layout (from action_space.py):
+      [0-4]   idle summon, [5-9] idle spsummon, [10-14] idle set monster,
+      [15-19] idle set S/T, [20-29] idle activate, [30-34] idle reposition,
+      [35] toBP, [36] toEP,
+      [37-41] battle attack, [42-46] battle activate,
+      [47] toM2, [48] toEP,
+      [49] yes, [50] no,
+      [51-60] select card 0-9,
+      [61] pos ATK, [62] pos DEF, [63-70] option 0-7
+    """
+    from ..core.message_parser import (
+        MsgSelectIdleCmd,
+        MsgSelectBattleCmd,
+        MsgSelectCard,
+        MsgSelectChain,
+        MsgSelectEffectYn,
+        MsgSelectTribute,
+    )
+
+    arr = np.zeros(ACTION_CARD_DIM, dtype=np.float32)
+    if msg is None:
+        return arr
+
+    if isinstance(msg, MsgSelectIdleCmd):
+        for i, c in enumerate(msg.summonable[:5]):
+            arr[0 + i] = float(card_index.code_to_index(c.code))
+        for i, c in enumerate(msg.spsummonable[:5]):
+            arr[5 + i] = float(card_index.code_to_index(c.code))
+        for i, c in enumerate(msg.setable_monsters[:5]):
+            arr[10 + i] = float(card_index.code_to_index(c.code))
+        for i, c in enumerate(msg.setable_st[:5]):
+            arr[15 + i] = float(card_index.code_to_index(c.code))
+        for i, c in enumerate(msg.activatable[:10]):
+            arr[20 + i] = float(card_index.code_to_index(c.code))
+        for i, c in enumerate(msg.repositionable[:5]):
+            arr[30 + i] = float(card_index.code_to_index(c.code))
+
+    elif isinstance(msg, MsgSelectBattleCmd):
+        for i, a in enumerate(msg.attackable[:5]):
+            if a.card is not None:
+                arr[37 + i] = float(card_index.code_to_index(a.card.code))
+        for i, c in enumerate(msg.activatable[:5]):
+            arr[42 + i] = float(card_index.code_to_index(c.code))
+
+    elif isinstance(msg, (MsgSelectCard, MsgSelectTribute)):
+        for i, c in enumerate(msg.cards[:10]):
+            arr[51 + i] = float(card_index.code_to_index(c.code))
+
+    elif isinstance(msg, MsgSelectChain):
+        for i, c in enumerate(msg.cards[:10]):
+            arr[51 + i] = float(card_index.code_to_index(c.code))
+
+    elif isinstance(msg, MsgSelectEffectYn):
+        arr[49] = float(card_index.code_to_index(msg.code))
+
+    return arr

@@ -69,9 +69,10 @@ class TestAdvancement:
 
     def test_plateau_triggers_advancement(self, scheduler):
         """Should advance when win rate plateaus above threshold."""
-        # First satisfy min steps, then plateau
+        # Need 2 * plateau_window (10) evals with flat improvement.
+        # Early window and late window both at 0.65 → improvement < 0.03
         base = 100_000
-        for i in range(5):
+        for i in range(10):
             scheduler.record_eval(0.65, base + (i + 1) * 20_000)
         assert scheduler.should_advance()
 

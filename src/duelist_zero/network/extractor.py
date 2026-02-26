@@ -36,6 +36,7 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
 
         features_dim = observation_space["features"].shape[0]
         num_card_slots = observation_space["card_ids"].shape[0]
+        num_action_cards = observation_space["action_cards"].shape[0]
 
         self.embedding = nn.Embedding(
             num_embeddings=vocab_size,
@@ -44,7 +45,8 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
         )
 
         flat_embed_dim = num_card_slots * embed_dim
-        combined_dim = features_dim + flat_embed_dim
+        action_embed_dim = num_action_cards * embed_dim
+        combined_dim = features_dim + flat_embed_dim + action_embed_dim
 
         self.mlp = nn.Sequential(
             nn.Linear(combined_dim, hidden_dim),
@@ -56,9 +58,13 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
         features = observations["features"]
         card_ids = observations["card_ids"].long()
+        action_cards = observations["action_cards"].long()
 
         embedded = self.embedding(card_ids)  # (batch, num_slots, embed_dim)
-        embedded_flat = embedded.view(embedded.size(0), -1)  # (batch, num_slots * embed_dim)
+        embedded_flat = embedded.view(embedded.size(0), -1)
 
-        combined = torch.cat([features, embedded_flat], dim=1)
+        action_embedded = self.embedding(action_cards)  # (batch, 71, embed_dim)
+        action_flat = action_embedded.view(action_embedded.size(0), -1)
+
+        combined = torch.cat([features, embedded_flat, action_flat], dim=1)
         return self.mlp(combined)

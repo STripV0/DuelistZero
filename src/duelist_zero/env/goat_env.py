@@ -52,10 +52,13 @@ from ..core.message_parser import (
 )
 from ..engine.duel import Duel, load_deck
 from ..engine.game_state import GameState
-from .observation import encode_observation, encode_card_ids, CardDB, OBSERVATION_DIM, CARD_ID_DIM
+from .observation import (
+    encode_observation, encode_card_ids, encode_action_cards,
+    CardDB, OBSERVATION_DIM, CARD_ID_DIM, ACTION_CARD_DIM,
+)
 from .card_index import CardIndex
 from .action_space import ActionSpace, ACTION_DIM, _respond_select_place
-from .reward import compute_reward, card_count
+from .reward import compute_reward
 from .heuristic import heuristic_action
 
 
@@ -69,8 +72,7 @@ _DEFAULT_SCRIPT_DIR = _PROJECT_ROOT / "data" / "script"
 _DEFAULT_DECK = _PROJECT_ROOT / "data" / "deck" / "Goat Control.ydk"
 
 # Max steps per episode before truncation.
-# Active GOAT games finish well within 200 steps.
-# Truncation penalty (-0.5) teaches the agent not to stall.
+# Truncation penalty (-1.0) treats stalling as equivalent to a loss.
 _MAX_STEPS = 200
 
 
@@ -78,7 +80,7 @@ class GoatEnv(gym.Env):
     """
     Gymnasium environment for GOAT-format Yu-Gi-Oh! duels.
 
-    Observation space: Dict(features=Box(329,), card_ids=Box(30,))
+    Observation space: Dict(features=Box(349,), card_ids=Box(30,))
     Action space: Discrete(ACTION_DIM)
 
     The agent plays as player 0 or 1 (randomized each episode).
@@ -97,7 +99,6 @@ class GoatEnv(gym.Env):
         opponent_deck_pool: Optional[list[str | Path]] = None,
         opponent_deck_weights: Optional[list[float]] = None,
         opponent_fn: Optional[Callable[[np.ndarray, np.ndarray], int]] = None,
-        step_penalty: float = 0.0,
         seed: Optional[int] = None,
         render_mode: Optional[str] = None,
     ):
@@ -110,7 +111,6 @@ class GoatEnv(gym.Env):
         self.opponent_deck_path = Path(opponent_deck_path) if opponent_deck_path else self.deck_path
         self.render_mode = render_mode
         self._opponent_fn = opponent_fn
-        self._step_penalty = step_penalty
 
         # Load engine (shared across episodes)
         self._core = OcgCore(self.lib_path)
@@ -126,7 +126,7 @@ class GoatEnv(gym.Env):
         # Gymnasium spaces
         self.observation_space = spaces.Dict({
             "features": spaces.Box(
-                low=0.0, high=1.0,
+                low=-1.0, high=1.0,
                 shape=(OBSERVATION_DIM,),
                 dtype=np.float32,
             ),
@@ -134,6 +134,12 @@ class GoatEnv(gym.Env):
                 low=0.0,
                 high=float(self._card_index.vocab_size - 1),
                 shape=(CARD_ID_DIM,),
+                dtype=np.float32,
+            ),
+            "action_cards": spaces.Box(
+                low=0.0,
+                high=float(self._card_index.vocab_size - 1),
+                shape=(ACTION_CARD_DIM,),
                 dtype=np.float32,
             ),
         })
@@ -159,8 +165,15 @@ class GoatEnv(gym.Env):
         self._pending_msg: Optional[ParsedMessage] = None
         self._step_count = 0
         self._agent_player = 0
-        self._prev_lp: Optional[tuple[int, int]] = None
-        self._prev_cards: Optional[tuple[int, int]] = None
+
+        # Deck identity indices for observation encoding
+        self._agent_deck_idx: int = 0
+        self._opp_deck_idx: int = 0
+
+        # Tribute-cancel loop prevention (Fix 2)
+        self._cancelled_tribute_code: Optional[int] = None
+        self._last_idle_action: Optional[int] = None
+        self._last_idle_msg: Optional[MsgSelectIdleCmd] = None
 
         # Seeding
         if seed is not None:
@@ -189,12 +202,16 @@ class GoatEnv(gym.Env):
 
         # Pick opponent deck (weighted random from pool if available)
         opp_deck = self._opp_deck
+        self._opp_deck_idx = 0
         if self._opp_deck_pool:
             if self._opp_deck_weights is not None:
                 idx = int(np.random.choice(len(self._opp_deck_pool), p=self._opp_deck_weights))
                 opp_deck = self._opp_deck_pool[idx]
+                self._opp_deck_idx = idx
             else:
-                opp_deck = random.choice(self._opp_deck_pool)
+                idx = random.randrange(len(self._opp_deck_pool))
+                opp_deck = self._opp_deck_pool[idx]
+                self._opp_deck_idx = idx
 
         # Create new duel — assign decks based on player order
         # Player 0 = deck1, Player 1 = deck2
@@ -210,8 +227,9 @@ class GoatEnv(gym.Env):
         self._duel.start()
 
         self._step_count = 0
-        self._prev_lp = None
-        self._prev_cards = None
+        self._cancelled_tribute_code = None
+        self._last_idle_action = None
+        self._last_idle_msg = None
 
         # Process until agent's first decision.
         # If the game ends before the agent gets a turn (e.g. opponent
@@ -237,19 +255,26 @@ class GoatEnv(gym.Env):
 
         self._step_count += 1
 
-        # Snapshot LP and card counts before advancing for reward shaping
-        state = self._duel.state
-        prev_lp = (
-            state.players[self._agent_player].lp,
-            state.players[1 - self._agent_player].lp,
-        )
-        prev_cards = (
-            card_count(state, self._agent_player),
-            card_count(state, 1 - self._agent_player),
-        )
-
         # If there's a pending decision, send the agent's action
         if self._pending_msg is not None:
+            # Track idle cmd context for tribute-cancel detection
+            if isinstance(self._pending_msg, MsgSelectIdleCmd):
+                self._last_idle_action = action
+                self._last_idle_msg = self._pending_msg
+
+            # Detect tribute cancel → record which card code to block
+            if isinstance(self._pending_msg, MsgSelectTribute) and action == 50:
+                # action 50 = _YESNO_NO = cancel
+                if self._last_idle_msg is not None and self._last_idle_action is not None:
+                    code = self._resolve_idle_card_code(
+                        self._last_idle_action, self._last_idle_msg
+                    )
+                    if code is not None:
+                        self._cancelled_tribute_code = code
+            else:
+                # Any non-cancel action clears the block
+                self._cancelled_tribute_code = None
+
             self._action_space_handler.decode(action, self._pending_msg, self._duel)
 
         # Advance until next agent decision or game end
@@ -259,16 +284,11 @@ class GoatEnv(gym.Env):
         terminated = state.is_finished
         truncated = self._step_count >= _MAX_STEPS and not terminated
 
-        reward = compute_reward(
-            state, self._agent_player,
-            prev_lp=prev_lp,
-            prev_cards=prev_cards,
-            step_penalty=self._step_penalty,
-        )
+        reward = compute_reward(state, self._agent_player)
 
-        # Truncation penalty: running out the clock is bad
+        # Truncation penalty: stalling is as bad as losing
         if truncated:
-            reward = -0.5
+            reward = -1.0
 
         obs = self._get_obs()
         info = self._get_info()
@@ -279,7 +299,40 @@ class GoatEnv(gym.Env):
         if self._pending_msg is None:
             # No pending decision — all actions valid (shouldn't happen in practice)
             return np.ones(ACTION_DIM, dtype=bool)
-        return self._action_space_handler.get_mask(self._pending_msg)
+        mask = self._action_space_handler.get_mask(self._pending_msg)
+
+        # Mask "go to battle" when no attack-position monsters on field
+        if isinstance(self._pending_msg, MsgSelectIdleCmd) and mask[35]:
+            me = self._duel.state.players[self._agent_player]
+            has_attacker = any(
+                m is not None and bool(m.position & POSITION.ATTACK)
+                for m in me.monsters
+            )
+            if not has_attacker:
+                mask[35] = False
+                # Ensure at least one action remains
+                if not mask.any():
+                    mask[35] = True
+
+        # Fix 2: Block summon/set of a card whose tribute was just cancelled
+        if (
+            self._cancelled_tribute_code is not None
+            and isinstance(self._pending_msg, MsgSelectIdleCmd)
+        ):
+            msg = self._pending_msg
+            blocked = self._cancelled_tribute_code
+            for i, c in enumerate(msg.summonable[:5]):
+                if c.code == blocked:
+                    mask[0 + i] = False
+            for i, c in enumerate(msg.setable_monsters[:5]):
+                if c.code == blocked:
+                    mask[10 + i] = False
+            # Ensure at least one action remains valid
+            if not mask.any():
+                mask = self._action_space_handler.get_mask(self._pending_msg)
+                self._cancelled_tribute_code = None
+
+        return mask
 
     def render(self) -> Optional[str]:
         if self._duel is None:
@@ -343,6 +396,64 @@ class GoatEnv(gym.Env):
         else:
             self._opp_deck_weights = None
 
+    def set_opponent_from_path(
+        self,
+        mode: str = "heuristic",
+        model_path: Optional[str] = None,
+        past_path: Optional[str] = None,
+    ) -> None:
+        """
+        Set the opponent policy using only picklable arguments.
+
+        This method is safe to call via SubprocVecEnv.env_method() since
+        it only accepts strings/None (no closures or model objects).
+
+        Args:
+            mode: One of "heuristic", "model", "mixed".
+            model_path: Path to frozen recent checkpoint (for "mixed").
+            past_path: Path to frozen older checkpoint (for "mixed").
+        """
+        if mode == "heuristic":
+            self._opponent_fn = None
+            return
+
+        from sb3_contrib import MaskablePPO as _MaskablePPO
+
+        if mode == "model":
+            assert model_path is not None
+            opp_model = _MaskablePPO.load(model_path)
+
+            def model_fn(obs, mask):
+                action, _ = opp_model.predict(obs, action_masks=mask, deterministic=False)
+                return int(action)
+
+            self._opponent_fn = model_fn
+
+        elif mode == "mixed":
+            # Frozen opponent pool: 60% heuristic, 20% recent frozen, 20% older frozen
+            recent_model = _MaskablePPO.load(model_path) if model_path else None
+            older_model = _MaskablePPO.load(past_path) if past_path else None
+
+            def mixed_fn(obs, mask):
+                r = np.random.random()
+                if r < 0.60:
+                    # Heuristic anchor
+                    return heuristic_action(mask)
+                elif r < 0.80:
+                    # Frozen recent checkpoint
+                    if recent_model is not None:
+                        action, _ = recent_model.predict(obs, action_masks=mask, deterministic=False)
+                        return int(action)
+                    return heuristic_action(mask)
+                else:
+                    # Frozen older checkpoint
+                    if older_model is not None:
+                        action, _ = older_model.predict(obs, action_masks=mask, deterministic=False)
+                        return int(action)
+                    return heuristic_action(mask)
+
+            self._opponent_fn = mixed_fn
+
     # ============================================================
     # Internal helpers
     # ============================================================
@@ -369,6 +480,12 @@ class GoatEnv(gym.Env):
             player = getattr(msg, "player", 0)
 
             if player == self._agent_player:
+                # Fix 1: auto-respond if only one valid action (forced decision)
+                mask = self._action_space_handler.get_mask(msg)
+                valid = np.where(mask)[0]
+                if len(valid) == 1:
+                    self._action_space_handler.decode(int(valid[0]), msg, duel)
+                    continue
                 return msg
             else:
                 opp_decisions += 1
@@ -395,11 +512,16 @@ class GoatEnv(gym.Env):
                     duel.state,
                     perspective=opp_perspective,
                     db=self._card_db,
+                    deck_id=self._opp_deck_idx,
                 ),
                 "card_ids": encode_card_ids(
                     duel.state,
                     perspective=opp_perspective,
                     card_index=self._card_index,
+                ),
+                "action_cards": encode_action_cards(
+                    msg,
+                    self._card_index,
                 ),
             }
             action = self._opponent_fn(opp_obs, mask)
@@ -411,23 +533,39 @@ class GoatEnv(gym.Env):
 
         self._action_space_handler.decode(action, msg, duel)
 
+    def _resolve_idle_card_code(
+        self, action: int, msg: MsgSelectIdleCmd
+    ) -> Optional[int]:
+        """Return the card code targeted by an idle cmd action, or None."""
+        if 0 <= action < 5 and action < len(msg.summonable):
+            return msg.summonable[action].code
+        if 10 <= action < 15 and (action - 10) < len(msg.setable_monsters):
+            return msg.setable_monsters[action - 10].code
+        return None
+
     def _get_obs(self) -> dict[str, np.ndarray]:
         """Encode current game state as observation dict."""
         if self._duel is None:
             return {
                 "features": np.zeros(OBSERVATION_DIM, dtype=np.float32),
                 "card_ids": np.zeros(CARD_ID_DIM, dtype=np.float32),
+                "action_cards": np.zeros(ACTION_CARD_DIM, dtype=np.float32),
             }
         return {
             "features": encode_observation(
                 self._duel.state,
                 perspective=self._agent_player,
                 db=self._card_db,
+                deck_id=self._agent_deck_idx,
             ),
             "card_ids": encode_card_ids(
                 self._duel.state,
                 perspective=self._agent_player,
                 card_index=self._card_index,
+            ),
+            "action_cards": encode_action_cards(
+                self._pending_msg,
+                self._card_index,
             ),
         }
 

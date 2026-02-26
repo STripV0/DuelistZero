@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from duelist_zero.env.goat_env import GoatEnv
-from duelist_zero.env.observation import OBSERVATION_DIM, CARD_ID_DIM
+from duelist_zero.env.observation import OBSERVATION_DIM, CARD_ID_DIM, ACTION_CARD_DIM
 from duelist_zero.env.action_space import ACTION_DIM
 
 
@@ -22,14 +22,17 @@ class TestReset:
     def test_reset_returns_valid_obs(self, env):
         obs, info = env.reset(seed=42)
         assert isinstance(obs, dict), f"Expected dict obs, got {type(obs)}"
-        assert "features" in obs and "card_ids" in obs
+        assert "features" in obs and "card_ids" in obs and "action_cards" in obs
         assert obs["features"].shape == (OBSERVATION_DIM,)
         assert obs["features"].dtype == np.float32
-        assert np.all(obs["features"] >= 0.0), "Features has values < 0"
+        assert np.all(obs["features"] >= -1.0), "Features has values < -1"
         assert np.all(obs["features"] <= 1.0), "Features has values > 1"
         assert obs["card_ids"].shape == (CARD_ID_DIM,)
         assert obs["card_ids"].dtype == np.float32
         assert np.all(obs["card_ids"] >= 0.0), "Card IDs has values < 0"
+        assert obs["action_cards"].shape == (ACTION_CARD_DIM,)
+        assert obs["action_cards"].dtype == np.float32
+        assert np.all(obs["action_cards"] >= 0.0), "Action cards has values < 0"
 
     def test_reset_returns_info_dict(self, env):
         _, info = env.reset(seed=1)
@@ -44,6 +47,7 @@ class TestReset:
         # Different seeds → different observations (usually)
         assert obs1["features"].shape == obs2["features"].shape == (OBSERVATION_DIM,)
         assert obs1["card_ids"].shape == obs2["card_ids"].shape == (CARD_ID_DIM,)
+        assert obs1["action_cards"].shape == obs2["action_cards"].shape == (ACTION_CARD_DIM,)
 
 
 class TestActionMask:
@@ -76,7 +80,8 @@ class TestStep:
         assert obs["features"].shape == (OBSERVATION_DIM,)
         assert obs["features"].dtype == np.float32
         assert obs["card_ids"].shape == (CARD_ID_DIM,)
-        assert -2.0 <= reward <= 2.0, f"Unexpected reward: {reward}"
+        assert obs["action_cards"].shape == (ACTION_CARD_DIM,)
+        assert -1.0 <= reward <= 1.0, f"Unexpected reward: {reward}"
         assert isinstance(terminated, bool)
         assert isinstance(truncated, bool)
         assert isinstance(info, dict)
@@ -86,7 +91,7 @@ class TestStep:
         mask = env.valid_action_mask()
         action = int(np.random.choice(np.where(mask)[0]))
         obs, _, _, _, _ = env.step(action)
-        assert np.all(obs["features"] >= 0.0)
+        assert np.all(obs["features"] >= -1.0)
         assert np.all(obs["features"] <= 1.0)
         assert np.all(obs["card_ids"] >= 0.0)
 
@@ -103,7 +108,7 @@ class TestStep:
             steps += 1
 
         assert done, f"Game did not finish in {steps} steps"
-        assert reward in (-1.0, -0.5, 0.0, 1.0), f"Terminal reward should be -1/-0.5/0/1, got {reward}"
+        assert -1.0 <= reward <= 1.0, f"Terminal reward out of range: {reward}"
 
 
 class TestStressTest:
@@ -127,8 +132,8 @@ class TestStressTest:
 
             # All duels must have terminated
             assert all(r[0] for r in results), "Some duels did not terminate"
-            # All terminal rewards must be valid
-            assert all(r[1] in (-1.0, -0.5, 0.0, 1.0) for r in results), "Invalid terminal rewards"
+            # All terminal rewards must be in valid range
+            assert all(-1.0 <= r[1] <= 1.0 for r in results), "Terminal rewards out of range"
             # Average steps should be reasonable (not all truncated)
             avg_steps = sum(r[2] for r in results) / len(results)
             assert avg_steps < 450, f"Average steps too high ({avg_steps:.0f}), likely truncating"

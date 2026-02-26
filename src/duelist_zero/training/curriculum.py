@@ -37,7 +37,7 @@ class CurriculumScheduler:
         win_rate_threshold: float = 0.60,
         min_stage_steps: int = 100_000,
         plateau_window: int = 5,
-        plateau_threshold: float = 0.02,
+        plateau_threshold: float = 0.03,
     ):
         self.deck_dir = Path(deck_dir)
         self.mirror_ratio = mirror_ratio
@@ -98,11 +98,15 @@ class CurriculumScheduler:
         if latest_wr < self.win_rate_threshold:
             return False
 
-        # Check for plateau: win rate improvement over recent evals is small
-        if len(self.eval_history) >= self.plateau_window:
-            recent = [wr for wr, _ in self.eval_history[-self.plateau_window:]]
-            improvement = max(recent) - min(recent)
-            if improvement < self.plateau_threshold:
+        # Check for plateau: compare two consecutive windows to detect
+        # when improvement has stalled.  Requires 2× plateau_window evals
+        # so we have an "early" and "late" window to compare.
+        required = 2 * self.plateau_window
+        if len(self.eval_history) >= required:
+            all_wr = [wr for wr, _ in self.eval_history[-required:]]
+            early_avg = sum(all_wr[: self.plateau_window]) / self.plateau_window
+            late_avg = sum(all_wr[self.plateau_window :]) / self.plateau_window
+            if late_avg >= self.win_rate_threshold and late_avg - early_avg < self.plateau_threshold:
                 return True
 
         return False
