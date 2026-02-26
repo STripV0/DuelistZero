@@ -6,7 +6,7 @@ A reinforcement learning agent that learns to play Yu-Gi-Oh! in the GOAT format 
 
 The agent uses MaskablePPO (masked action-space PPO) with self-play training to learn game strategy from zero domain knowledge.
 
-GOAT format is the starting point — the long-term goal is to extend Duelist Zero to the current TCG/OCG format with the full modern cardpool.
+GOAT format is the starting point. Tthe long-term goal is to extend Duelist Zero to the current TCG/OCG format with the full modern cardpool.
 
 ## Setup
 
@@ -14,7 +14,7 @@ GOAT format is the starting point — the long-term goal is to extend Duelist Ze
 
 ```bash
 # Clone with submodules
-git clone --recurse-submodules <repo-url>
+git clone --recurse-submodules https://github.com/STripV0/DuelistZero.git
 cd duelist-zero
 
 # Download Lua 5.3.5 (required by ygopro-core)
