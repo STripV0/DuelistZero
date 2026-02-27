@@ -170,6 +170,10 @@ class GoatEnv(gym.Env):
         self._agent_deck_idx: int = 0
         self._opp_deck_idx: int = 0
 
+        # Per-episode opponent selection (set via set_opponent_from_path)
+        self._opponent_mode: str = "heuristic"
+        self._opponent_models: dict = {}
+
         # Tribute-cancel loop prevention (Fix 2)
         self._cancelled_tribute_code: Optional[int] = None
         self._last_idle_action: Optional[int] = None
@@ -200,18 +204,46 @@ class GoatEnv(gym.Env):
         # Randomize which player the agent controls each episode
         self._agent_player = random.choice([0, 1])
 
-        # Pick opponent deck (weighted random from pool if available)
-        opp_deck = self._opp_deck
-        self._opp_deck_idx = 0
-        if self._opp_deck_pool:
-            if self._opp_deck_weights is not None:
-                idx = int(np.random.choice(len(self._opp_deck_pool), p=self._opp_deck_weights))
-                opp_deck = self._opp_deck_pool[idx]
-                self._opp_deck_idx = idx
+        # Per-episode opponent and deck selection
+        if self._opponent_mode == "mixed":
+            # Roll opponent type for this episode
+            r = np.random.random()
+            if r < 0.60:
+                # Heuristic with diverse deck from pool
+                self._opponent_fn = None
+                opp_deck = self._pick_diverse_deck()
+            elif r < 0.80:
+                # Recent frozen checkpoint with mirror deck
+                model = self._opponent_models.get("recent")
+                if model is not None:
+                    def _fn(obs, mask, m=model):
+                        action, _ = m.predict(obs, action_masks=mask, deterministic=False)
+                        return int(action)
+                    self._opponent_fn = _fn
+                else:
+                    self._opponent_fn = None
+                opp_deck = self._agent_deck  # mirror
+                self._opp_deck_idx = self._agent_deck_idx
             else:
-                idx = random.randrange(len(self._opp_deck_pool))
-                opp_deck = self._opp_deck_pool[idx]
-                self._opp_deck_idx = idx
+                # Older frozen checkpoint with mirror deck
+                model = self._opponent_models.get("older")
+                if model is not None:
+                    def _fn(obs, mask, m=model):
+                        action, _ = m.predict(obs, action_masks=mask, deterministic=False)
+                        return int(action)
+                    self._opponent_fn = _fn
+                else:
+                    self._opponent_fn = None
+                opp_deck = self._agent_deck  # mirror
+                self._opp_deck_idx = self._agent_deck_idx
+        elif self._opponent_mode == "heuristic":
+            # Heuristic with diverse deck from pool
+            self._opponent_fn = None
+            opp_deck = self._pick_diverse_deck()
+        else:
+            # "model" mode — mirror deck
+            opp_deck = self._agent_deck
+            self._opp_deck_idx = self._agent_deck_idx
 
         # Create new duel — assign decks based on player order
         # Player 0 = deck1, Player 1 = deck2
@@ -408,13 +440,21 @@ class GoatEnv(gym.Env):
         This method is safe to call via SubprocVecEnv.env_method() since
         it only accepts strings/None (no closures or model objects).
 
+        Modes:
+            "heuristic": Heuristic opponent with diverse decks from pool.
+            "model": Single checkpoint opponent with mirror deck.
+            "mixed": Per-episode roll — 60% heuristic (diverse deck),
+                     20% recent frozen (mirror), 20% older frozen (mirror).
+
         Args:
             mode: One of "heuristic", "model", "mixed".
-            model_path: Path to frozen recent checkpoint (for "mixed").
+            model_path: Path to frozen recent checkpoint (for "model"/"mixed").
             past_path: Path to frozen older checkpoint (for "mixed").
         """
         if mode == "heuristic":
             self._opponent_fn = None
+            self._opponent_mode = "heuristic"
+            self._opponent_models = {}
             return
 
         from sb3_contrib import MaskablePPO as _MaskablePPO
@@ -428,31 +468,18 @@ class GoatEnv(gym.Env):
                 return int(action)
 
             self._opponent_fn = model_fn
+            self._opponent_mode = "model"
+            self._opponent_models = {}
 
         elif mode == "mixed":
-            # Frozen opponent pool: 60% heuristic, 20% recent frozen, 20% older frozen
+            # Load models once, store for per-episode selection in reset()
             recent_model = _MaskablePPO.load(model_path) if model_path else None
             older_model = _MaskablePPO.load(past_path) if past_path else None
-
-            def mixed_fn(obs, mask):
-                r = np.random.random()
-                if r < 0.60:
-                    # Heuristic anchor
-                    return heuristic_action(mask)
-                elif r < 0.80:
-                    # Frozen recent checkpoint
-                    if recent_model is not None:
-                        action, _ = recent_model.predict(obs, action_masks=mask, deterministic=False)
-                        return int(action)
-                    return heuristic_action(mask)
-                else:
-                    # Frozen older checkpoint
-                    if older_model is not None:
-                        action, _ = older_model.predict(obs, action_masks=mask, deterministic=False)
-                        return int(action)
-                    return heuristic_action(mask)
-
-            self._opponent_fn = mixed_fn
+            self._opponent_mode = "mixed"
+            self._opponent_models = {
+                "recent": recent_model,
+                "older": older_model,
+            }
 
     # ============================================================
     # Internal helpers
@@ -460,6 +487,18 @@ class GoatEnv(gym.Env):
     # Max opponent decisions per _advance() call before force-ending.
     # Prevents infinite loops from heuristic/opponent policies.
     _MAX_OPP_DECISIONS = 500
+
+    def _pick_diverse_deck(self) -> tuple:
+        """Pick an opponent deck from the pool, or fall back to default."""
+        if self._opp_deck_pool:
+            if self._opp_deck_weights is not None:
+                idx = int(np.random.choice(len(self._opp_deck_pool), p=self._opp_deck_weights))
+            else:
+                idx = random.randrange(len(self._opp_deck_pool))
+            self._opp_deck_idx = idx
+            return self._opp_deck_pool[idx]
+        self._opp_deck_idx = 0
+        return self._opp_deck
 
     def _advance(self) -> Optional[ParsedMessage]:
         """

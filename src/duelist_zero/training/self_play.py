@@ -2,14 +2,12 @@
 Self-play training pipeline using MaskablePPO from sb3-contrib.
 
 Trains a YuGiOh GOAT format agent via gated self-play:
-1. Phase 1: Train against heuristic until 80%+ win rate
-2. Phase 2: Self-play with mixed opponents (70% self, 15% heuristic, 15% past)
-3. Curriculum: start with mirror match, gradually add diverse decks
+1. Phase 1: Train against heuristic (diverse decks) until threshold or step limit
+2. Phase 2: Per-episode mixed opponent — 60% heuristic (diverse deck),
+   20% recent frozen checkpoint (mirror), 20% older frozen (mirror)
 
 Usage:
-    uv run python -m duelist_zero.training.self_play --timesteps 2000000
-    uv run python -m duelist_zero.training.self_play --timesteps 500000 --no-curriculum
-    uv run python -m duelist_zero.training.self_play --timesteps 5000000 --n-envs 8
+    uv run python -m duelist_zero.training.self_play --timesteps 25000000 --n-envs 8
 """
 
 import argparse
@@ -23,7 +21,6 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 from ..env.goat_env import GoatEnv
 from ..network.extractor import CardEmbeddingExtractor
 from .callbacks import SelfPlayCallback
-from .curriculum import CurriculumScheduler
 from .eval import evaluate
 
 
@@ -50,7 +47,7 @@ def _make_env(
 
 
 def train(
-    timesteps: int = 500_000,
+    timesteps: int = 25_000_000,
     checkpoint_interval: int = 50_000,
     save_dir: str = "checkpoints",
     eval_episodes: int = 200,
@@ -59,11 +56,10 @@ def train(
     batch_size: int = 512,
     learning_rate: float = 1e-4,
     n_envs: int = 8,
-    mirror_ratio: float = 0.70,
-    no_curriculum: bool = False,
     no_self_play: bool = False,
     self_play_threshold: float = 0.75,
     regression_gate: float = 0.70,
+    heuristic_limit: int = 5_000_000,
     verbose: int = 1,
 ):
     """
@@ -79,8 +75,6 @@ def train(
         batch_size: PPO minibatch size
         learning_rate: PPO learning rate
         n_envs: Number of parallel environments
-        mirror_ratio: Curriculum mirror match sampling weight
-        no_curriculum: Disable curriculum (use all decks from start)
         no_self_play: Disable self-play (train vs heuristic only)
         self_play_threshold: Win rate vs heuristic to activate self-play
         regression_gate: Deactivate self-play if heuristic win rate drops below this
@@ -89,44 +83,21 @@ def train(
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
 
-    # Set up curriculum or discover full deck pool
+    # Discover all available decks for diverse opponent games
     deck_dir = Path(__file__).resolve().parents[3] / "data" / "deck"
+    deck_files = sorted(deck_dir.glob("*.ydk"))
+    deck_pool = [str(p) for p in deck_files] if len(deck_files) > 1 else None
+    deck_weights = None  # uniform sampling
+
+    if verbose and deck_pool:
+        print(f"Opponent deck pool: {len(deck_files)} decks")
+        for d in deck_files:
+            print(f"  - {d.name}")
+
+    # Curriculum is no longer used for deck gating — all decks available
+    # from the start. Heuristic games use diverse decks, checkpoint games
+    # use mirror matches (handled per-episode in GoatEnv.reset).
     curriculum = None
-    deck_pool = None
-    deck_weights = None
-
-    if no_curriculum:
-        # No curriculum: use all decks with equal weights
-        deck_files = sorted(deck_dir.glob("*.ydk"))
-        if verbose and len(deck_files) > 1:
-            print(f"Opponent deck pool: {len(deck_files)} decks")
-            for d in deck_files:
-                print(f"  - {d.name}")
-        if len(deck_files) > 1:
-            deck_pool = [str(p) for p in deck_files]
-    else:
-        # Curriculum: start with mirror match, expand over time
-        curriculum = CurriculumScheduler(
-            deck_dir=deck_dir,
-            mirror_ratio=mirror_ratio,
-        )
-
-        # Load curriculum state if resuming
-        curriculum_path = save_path / "curriculum.json"
-        if resume and curriculum_path.exists():
-            curriculum.load_state(curriculum_path)
-            if verbose:
-                print(f"Resumed curriculum from {curriculum_path}")
-                print(f"  {curriculum.stage_summary()}")
-
-        pool = curriculum.deck_pool
-        weights = curriculum.deck_weights
-        if verbose:
-            print(f"Curriculum enabled ({curriculum.max_stage + 1} stages)")
-            print(f"  {curriculum.stage_summary()}")
-
-        deck_pool = [str(p) for p in pool]
-        deck_weights = weights
 
     # Get vocab_size from a temporary GoatEnv (can't access subprocess envs)
     tmp_env = GoatEnv()
@@ -190,10 +161,10 @@ def train(
         checkpoint_interval=checkpoint_interval,
         save_dir=str(save_path),
         eval_episodes=eval_episodes,
-        curriculum=curriculum,
         no_self_play=no_self_play,
         self_play_threshold=self_play_threshold,
         regression_gate=regression_gate,
+        heuristic_limit=heuristic_limit,
         verbose=verbose,
     )
 
@@ -254,7 +225,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train MaskablePPO agent with self-play on GOAT format YuGiOh"
     )
-    parser.add_argument("--timesteps", type=int, default=500_000,
+    parser.add_argument("--timesteps", type=int, default=25_000_000,
                         help="Total training timesteps")
     parser.add_argument("--checkpoint-interval", type=int, default=50_000,
                         help="Steps between checkpoints and evals")
@@ -272,16 +243,14 @@ if __name__ == "__main__":
                         help="Learning rate")
     parser.add_argument("--n-envs", type=int, default=8,
                         help="Number of parallel environments")
-    parser.add_argument("--mirror-ratio", type=float, default=0.70,
-                        help="Curriculum: mirror match sampling weight")
-    parser.add_argument("--no-curriculum", action="store_true",
-                        help="Disable curriculum learning (use all decks from start)")
     parser.add_argument("--no-self-play", action="store_true",
                         help="Disable self-play (train vs heuristic only)")
     parser.add_argument("--self-play-threshold", type=float, default=0.75,
                         help="Win rate vs heuristic to activate self-play")
     parser.add_argument("--regression-gate", type=float, default=0.70,
                         help="Deactivate self-play if heuristic win rate drops below this")
+    parser.add_argument("--heuristic-limit", type=int, default=5_000_000,
+                        help="Force self-play activation after this many steps vs heuristic")
     args = parser.parse_args()
 
     train(
@@ -294,9 +263,8 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         learning_rate=args.lr,
         n_envs=args.n_envs,
-        mirror_ratio=args.mirror_ratio,
-        no_curriculum=args.no_curriculum,
         no_self_play=args.no_self_play,
         self_play_threshold=args.self_play_threshold,
         regression_gate=args.regression_gate,
+        heuristic_limit=args.heuristic_limit,
     )

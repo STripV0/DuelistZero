@@ -10,7 +10,6 @@ import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 from ..env.goat_env import GoatEnv
-from .curriculum import CurriculumScheduler
 from .eval import EloTracker, evaluate
 
 
@@ -18,12 +17,13 @@ class SelfPlayCallback(BaseCallback):
     """
     Callback that implements gated self-play during MaskablePPO training.
 
-    Phase 1 (pre-training): Train vs heuristic until win rate exceeds
-    `self_play_threshold` for `self_play_window` consecutive evals.
+    Phase 1 (pre-training): Train vs heuristic (diverse decks) until win rate
+    exceeds `self_play_threshold` for `self_play_window` consecutive evals,
+    or `heuristic_limit` steps reached.
 
-    Phase 2 (self-play): Mixed opponent — 40% current self, 40% heuristic,
-    20% sampled past checkpoint. Prevents catastrophic forgetting by
-    always retaining exposure to baseline opponents.
+    Phase 2 (self-play): Per-episode opponent roll — 60% heuristic (diverse
+    deck), 20% recent frozen checkpoint (mirror), 20% older frozen checkpoint
+    (mirror). Regression gate deactivates self-play if heuristic WR drops.
 
     Uses a dedicated eval env (main process) and broadcasts opponent
     changes to training envs via env_method().
@@ -33,23 +33,23 @@ class SelfPlayCallback(BaseCallback):
         self,
         checkpoint_interval: int = 50_000,
         save_dir: str = "checkpoints",
-        eval_episodes: int = 20,
-        curriculum: Optional[CurriculumScheduler] = None,
+        eval_episodes: int = 200,
         no_self_play: bool = False,
-        self_play_threshold: float = 0.80,
+        self_play_threshold: float = 0.75,
         self_play_window: int = 3,
         regression_gate: float = 0.70,
+        heuristic_limit: int = 5_000_000,
         verbose: int = 1,
     ):
         super().__init__(verbose)
         self.checkpoint_interval = checkpoint_interval
         self.save_dir = Path(save_dir)
         self.eval_episodes = eval_episodes
-        self.curriculum = curriculum
         self.no_self_play = no_self_play
         self.self_play_threshold = self_play_threshold
         self.self_play_window = self_play_window
         self.regression_gate = regression_gate
+        self.heuristic_limit = heuristic_limit
 
         # Checkpoint pool: list of (path, checkpoint_id)
         self.pool: list[tuple[Path, str]] = []
@@ -104,8 +104,7 @@ class SelfPlayCallback(BaseCallback):
             print(f"[Eval] vs Heuristic: {win_rate:.0%} "
                   f"({result['wins']}W/{result['losses']}L/{result['draws']}D)")
 
-        # 3. Evaluate vs past checkpoint (more meaningful at late stages)
-        curriculum_wr = win_rate  # default: use heuristic win rate
+        # 3. Evaluate vs past checkpoint (mirror match)
         if self._self_play_active and len(self.pool) >= 2:
             past_path, past_id = self._sample_recent_opponent(exclude=ckpt_id)
             past_fn = self._make_opponent_fn(past_path)
@@ -113,30 +112,16 @@ class SelfPlayCallback(BaseCallback):
             past_result = evaluate(env, agent_fn, n_episodes=self.eval_episodes)
             past_wr = past_result["win_rate"]
             self.elo.record_match(ckpt_id, past_id, past_wr, step=step)
-            curriculum_wr = past_wr
             if self.verbose:
                 print(f"[Eval] vs {past_id}: {past_wr:.0%} "
                       f"({past_result['wins']}W/{past_result['losses']}L/"
                       f"{past_result['draws']}D)")
 
-        # 4. Curriculum: record eval and check for advancement
-        if self.curriculum is not None:
-            self.curriculum.record_eval(curriculum_wr, step)
-            if self.curriculum.should_advance():
-                new_stage = self.curriculum.advance()
-                pool = [str(p) for p in self.curriculum.deck_pool]
-                weights = self.curriculum.deck_weights
-                self._broadcast_deck_pool(pool, weights)
-                if self.verbose:
-                    print(f"[Curriculum] Advanced to stage {new_stage}")
-                    print(f"[Curriculum] {self.curriculum.stage_summary()}")
-            self.curriculum.save_state(self.save_dir / "curriculum.json")
-
-        # 5. Self-play gating (activation and regression)
+        # 4. Self-play gating (activation and regression)
         self._recent_win_rates.append(win_rate)
         if not self.no_self_play:
             if not self._self_play_active:
-                # Check if self-play should activate
+                # Check if self-play should activate (threshold met)
                 if len(self._recent_win_rates) >= self.self_play_window:
                     recent = self._recent_win_rates[-self.self_play_window :]
                     if all(wr >= self.self_play_threshold for wr in recent):
@@ -146,6 +131,14 @@ class SelfPlayCallback(BaseCallback):
                                 f"[SelfPlay] ACTIVATED — last {self.self_play_window} "
                                 f"evals all >= {self.self_play_threshold:.0%}"
                             )
+                # Force-activate if heuristic phase has exceeded step limit
+                if not self._self_play_active and step >= self.heuristic_limit:
+                    self._self_play_active = True
+                    if self.verbose:
+                        print(
+                            f"[SelfPlay] FORCE-ACTIVATED — heuristic limit "
+                            f"({self.heuristic_limit:,} steps) reached"
+                        )
             else:
                 # Regression gate: deactivate if heuristic win rate drops too low
                 if win_rate < self.regression_gate:
@@ -156,7 +149,7 @@ class SelfPlayCallback(BaseCallback):
                             f"{win_rate:.0%} < {self.regression_gate:.0%} gate"
                         )
 
-        # 6. Set training opponent via broadcasting (frozen opponent pool)
+        # 5. Set training opponent via broadcasting (frozen opponent pool)
         if self._self_play_active and len(self.pool) >= 2:
             # Stratified sampling: recent frozen + older frozen
             recent_path, recent_id = self._sample_recent_opponent(
@@ -172,9 +165,9 @@ class SelfPlayCallback(BaseCallback):
                 past_path=str(older_path),
             )
             if self.verbose:
-                print(f"[SelfPlay] Frozen pool: 60% heuristic + 20% {recent_id} + 20% {older_id}")
+                print(f"[SelfPlay] 60% heuristic (diverse) + 20% {recent_id} (mirror) + 20% {older_id} (mirror)")
         else:
-            # Heuristic-only (pre-training, no_self_play, or regression gate)
+            # Heuristic-only with diverse decks
             self._broadcast_opponent(mode="heuristic")
 
         if self.verbose:
@@ -210,21 +203,6 @@ class SelfPlayCallback(BaseCallback):
             while hasattr(env, "env"):
                 env = env.env
             env.set_opponent_from_path(mode=mode, model_path=model_path, past_path=past_path)
-
-    def _broadcast_deck_pool(
-        self,
-        pool: list[str],
-        weights: Optional[list[float]] = None,
-    ) -> None:
-        """Set deck pool on all training envs."""
-        venv = self.training_env
-        if hasattr(venv, "env_method"):
-            venv.env_method("set_deck_pool", pool, weights)
-        else:
-            env = venv.envs[0]
-            while hasattr(env, "env"):
-                env = env.env
-            env.set_deck_pool(pool, weights)
 
     def _make_agent_fn(self):
         """Create an agent function from the current model."""
