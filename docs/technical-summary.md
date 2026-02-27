@@ -32,14 +32,14 @@ CardEmbeddingExtractor:
                                          ─────
   Concatenated:                          4,225
 
-  Linear(4225, 256) → ReLU
-  Linear(256, 256)  → ReLU
+  Linear(4225, 512) → ReLU
+  Linear(512, 512)  → ReLU
                        │
               ┌────────┴────────┐
          Policy Head       Value Head
-      Linear(256, 256)   Linear(256, 256)
-      Linear(256, 128)   Linear(256, 128)
-      Linear(128, 71)    Linear(128, 1)
+      Linear(512, 512)   Linear(512, 512)
+      Linear(512, 256)   Linear(512, 256)
+      Linear(256, 71)    Linear(256, 1)
 ```
 
 ## Observation Space (353 features)
@@ -392,6 +392,45 @@ No bugs. Short session for project exploration.
 **Root cause:** Missing turn counter, no relative advantage features, no graveyard contents, battle not masked when no attackers.
 **Fix:** Added turn counter, 3 relative features, graveyard card IDs (20 slots), battle masking. Obs: 349→353, card IDs: 30→50.
 
+## Session 13 — Feb 26 (Network Scaling + Eval Improvements)
+
+### Issue 59: Eval noise masking true performance (50 episodes)
+**Problem:** 50-episode evals gave ±6% noise. Agent hit 92% once but couldn't reliably demonstrate 75%+ for self-play activation.
+**Fix:** Increased eval episodes to 200 (±3% noise).
+
+### Issue 60: Network bottleneck (4,225 → 256 compression)
+**Problem:** 4,225-dimensional input compressed to 256-wide hidden layer. Too aggressive for the information content.
+**Fix:** Doubled to 512-wide hidden, policy/value heads [512, 256].
+
+### Issue 61: 5M heuristic-only plateau (~70-77%)
+**Problem:** Agent plateaued at 70-77% vs heuristic over 5M steps. Peaked at 80% but never hit 3 consecutive 75%+ evals to trigger self-play.
+**Trend:** Win rate oscillated between 60-80% with no upward trend after 1M steps.
+
+### Issue 62: EDOPro bot missing action_cards observation
+**Problem:** Bot client only sent `features` and `card_ids` to model, missing the `action_cards` key. Every decision threw KeyError and fell back to first valid action (essentially playing as heuristic).
+**Fix:** Added `encode_action_cards(msg, self.card_index)` to bot's observation dict.
+
+## Session 14 — Feb 26-27 (Self-Play + Frozen Pool Training)
+
+### Issue 63: Per-decision opponent mixing (design flaw)
+**Problem:** Mixed opponent mode rolled heuristic/recent/older checkpoint per individual action, not per episode. Same game could have different "players" making decisions, creating incoherent opponent behavior.
+**Fix:** Changed to per-episode opponent roll in `reset()`. Each game faces a single consistent opponent.
+
+### Issue 64: Frozen checkpoint losing to past versions (25-36%)
+**Problem:** During 20M self-play run, current agent consistently lost to its own past checkpoints (25-36% win rate). Flat trend — no improvement over 3M+ steps of self-play.
+**Possible causes:** Non-transitivity (rock-paper-scissors dynamics), training signal spread too thin across mixed opponents, deck matchup noise contaminating signal.
+
+### Issue 65: Curriculum stuck at stage 0 (Goat Control only)
+**Problem:** Curriculum advancement used vs-checkpoint win rate, which oscillated wildly (25-73%). Never met plateau detection criteria. After 3M+ steps of self-play, still on stage 0.
+**Impact:** Agent and all opponents only ever played Goat Control mirrors.
+
+### Issue 66: Mirror vs diverse deck strategy mismatch
+**Problem:** All training (heuristic + checkpoints) used the same single-deck pool. Agent never learned to handle different deck strategies or card interactions. Heuristic with diverse decks would teach broader game knowledge.
+**Fix:** Separated deck selection by opponent type:
+- Heuristic games → diverse decks from full pool (7 decks)
+- Checkpoint games → mirror matches (same deck as agent)
+Removed curriculum system. All decks available from start.
+
 ---
 
 ## Critical Bugs Summary (by impact)
@@ -404,3 +443,5 @@ No bugs. Short session for project exploration.
 6. **Heuristic attack-cancel loop** (#46) — Chain-pass cancelled attack targets, infinite battle loop.
 7. **No action-to-card mapping** (#33) — Agent couldn't connect actions to cards on field/hand.
 8. **Observation blind spots** (#58) — Missing turn count, relative advantage, graveyard contents.
+9. **Per-decision opponent mixing** (#63) — Opponent type changed mid-game, incoherent opponent behavior.
+10. **Single-deck training** (#65, #66) — Curriculum stuck at Goat Control only. Agent never exposed to diverse strategies.
