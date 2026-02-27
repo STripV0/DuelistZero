@@ -21,7 +21,7 @@ from ..core.message_parser import (
 from ..engine.duel import load_deck
 from ..engine.game_state import GameState, update_state
 from ..env.action_space import ActionSpace
-from ..env.observation import encode_observation, encode_card_ids, CardDB
+from ..env.observation import encode_observation, encode_card_ids, encode_action_cards, CardDB
 from ..env.card_index import CardIndex
 from .protocol import (
     send_packet, recv_packet,
@@ -252,6 +252,9 @@ class EdoProBot:
                     ),
                     "card_ids": encode_card_ids(
                         self.state, perspective=self.my_player, card_index=self.card_index
+                    ),
+                    "action_cards": encode_action_cards(
+                        msg, self.card_index
                     ),
                 }
             else:
