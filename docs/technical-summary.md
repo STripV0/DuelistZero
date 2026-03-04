@@ -2,54 +2,88 @@
 
 ## Algorithm
 
-**MaskablePPO** (sb3-contrib) — Proximal Policy Optimization with invalid action masking. The action mask ensures the agent only selects legal game moves at each step.
+**MaskableRecurrentPPO** — Custom algorithm merging sb3-contrib's RecurrentPPO (LSTM memory) + MaskablePPO (action masking). LSTM tracks temporal state across game decisions within an episode.
 
 | Parameter | Value |
 |---|---|
-| Learning rate | 1e-4 |
-| n_steps (rollout) | 2,048 |
-| Batch size | 512 |
-| n_epochs | 4 |
+| Learning rate | 3e-5 |
+| n_steps (rollout) | 512 |
+| Batch size | 128 |
+| n_epochs | 2 |
 | Gamma | 0.99 |
 | Entropy coef | 0.10 |
 | Clip range | 0.2 |
 | Parallel envs | 8 (SubprocVecEnv) |
+| LSTM hidden size | 256 |
+| LSTM layers | 1 |
 
 ## Neural Network Architecture
 
 ```
 Observation Dict
-  ├── "features"      (503,) float32  — game state features
-  ├── "card_ids"      (50,)  float32  — card identity indices
-  └── "action_cards"  (71,)  float32  — card index per action slot
+  ├── "features"         (453,)    float32 — game state features
+  ├── "card_ids"         (50,)     float32 — card identity indices
+  ├── "action_features"  (71, 12)  float32 — rich per-action features
+  └── "action_history"   (16, 10)  float32 — structured action history
 
-CardEmbeddingExtractor (Two-Stream + Transformer Attention):
+CardEmbeddingExtractor (Three-Segment Transformer):
 
   nn.Embedding(vocab_size=~14k, embed_dim=32, padding_idx=0)
-    └── optionally initialized from LLM-pretrained embeddings (.npy)
+    └── optionally initialized from pretrained embeddings (.npy)
 
-  Stream A (features):
-    features → passthrough → (503)
+  Board tokens:   card_ids(50) → embed(32) → Linear(32, 64)       → (50, 64)
+  Action tokens:  action_features(71,12) → embed col0 + cols1-11  → Linear(43, 64) → (71, 64)
+  History tokens: action_history(16,10)  → embed col0 + cols1-9   → Linear(41, 64) → (16, 64)
 
-  Stream B (cards — transformer attention):
-    card_ids     → Embedding → (50, 32)  ─┐
-    action_cards → Embedding → (71, 32)  ─┤ + segment embeddings
-                                           ↓
-    Concatenate → (121, 32) → TransformerEncoder(2 layers, 4 heads)
-                            → flatten → (121 × 32 = 3,872)
-                            → Linear(3872, 256) → ReLU → (256)
+  + segment_embedding(3, 64): board=0, action=1, history=2
+  → concat: (137, 64)
+  → TransformerEncoder(d_model=64, heads=4, layers=2)
+  → segment-aware masked mean pooling
+  → board_pool(64) | action_pool(64) | history_pool(64)
+  → Linear(192, 256) + ReLU → embed_stream(256)
 
   Merge:
-    [Stream A (503) | Stream B (256)] = 759
-    → Linear(759, 512) → ReLU
-    → Linear(512, 512) → ReLU
+    [features(453) | embed_stream(256)] = 709
+    → Linear(709, 256) → ReLU
+    → Linear(256, 256) → ReLU → LSTM(256) →
                            │
                   ┌────────┴────────┐
              Policy Head       Value Head
-          Linear(512, 512)   Linear(512, 512)
           Linear(512, 256)   Linear(512, 256)
           Linear(256, 71)    Linear(256, 1)
 ```
+
+### action_features — (71, 12) per action slot
+
+| Col | Feature | Range |
+|---|---|---|
+| 0 | card_id (embedding index) | [0, vocab) |
+| 1 | is_summon | {0,1} |
+| 2 | is_spsummon | {0,1} |
+| 3 | is_set | {0,1} |
+| 4 | is_activate | {0,1} |
+| 5 | is_attack | {0,1} |
+| 6 | is_reposition | {0,1} |
+| 7 | is_phase/pass/other | {0,1} |
+| 8 | ATK / 5000 | [0,1] |
+| 9 | DEF / 5000 | [0,1] |
+| 10 | level / 12 | [0,1] |
+| 11 | location | 0.0=none, 0.2=hand, 0.4=mzone, 0.6=szone, 0.8=grave, 1.0=removed |
+
+### action_history — (16, 10) last 16 public actions
+
+| Col | Feature | Range |
+|---|---|---|
+| 0 | card_id (embedding index) | [0, vocab) |
+| 1 | player (0=me, 1=opp) | {0,1} |
+| 2 | is_summon | {0,1} |
+| 3 | is_set | {0,1} |
+| 4 | is_activate | {0,1} |
+| 5 | is_attack | {0,1} |
+| 6 | is_draw | {0,1} |
+| 7 | ATK / 5000 | [0,1] |
+| 8 | DEF / 5000 | [0,1] |
+| 9 | turns_ago / 40 | [0,1] |
 
 ### LLM-Pretrained Card Embeddings
 
@@ -63,7 +97,9 @@ Card embeddings can be pre-initialized from card text using sentence-transformer
 Generate: `uv run --group embeddings python scripts/generate_card_embeddings.py`
 Train with: `--pretrained-embeddings data/card_embeddings.npy`
 
-## Observation Space (503 features)
+## Observation Space (453 features + structured keys)
+
+### features (453,)
 
 | Range | Description |
 |---|---|
@@ -72,17 +108,20 @@ Train with: `--pretrained-embeddings data/card_embeddings.npy`
 | [18] | Turn player flag |
 | [19] | Turn count / 40 |
 | [20-22] | Relative advantage: LP diff, monster count diff, ATK diff ([-1,1]) |
-| [23-102] | My monster zone: 5 slots × 16 features (occupied, face_up, atk_pos, atk, def, level, type×3, attribute×3, effect, flip, fusion, ritual) |
-| [103-152] | My spell/trap zone: 5 slots × 10 features (occupied, face_up, spell, trap, continuous, equip, quickplay, field, counter, ritual) |
+| [23-102] | My monster zone: 5 slots × 16 features |
+| [103-152] | My spell/trap zone: 5 slots × 10 features |
 | [153-232] | Opp monster zone: 5 slots × 16 features (face-down stats hidden) |
 | [233-282] | Opp spell/trap zone: 5 slots × 10 features (face-down hidden) |
-| [283-432] | My hand: 10 slots × 15 features (level, atk, def, type×3, attribute×2, effect, flip, fusion, ritual, quickplay, field, counter) |
-| [433-482] | Action history: last 10 actions × 5 features |
-| [483-502] | Deck identity one-hot |
+| [283-432] | My hand: 10 slots × 15 features |
+| [433-452] | Deck identity one-hot (20) |
 
-Card IDs (50 slots): my field (10) + opp field face-up (10) + my hand (10) + my GY top 10 + opp GY top 10
+### card_ids (50,)
 
-Action cards (71 slots): card embedding index for each action in the 71-action space.
+My field (10) + opp field face-up (10) + my hand (10) + my GY top 10 + opp GY top 10.
+
+### action_features (71, 12) and action_history (16, 10)
+
+See architecture section above for full column layouts.
 
 ## Action Space (71 discrete actions)
 
@@ -121,15 +160,16 @@ Sparse terminal reward only — no intermediate shaping.
 
 ## Training Strategy
 
-**Phase 1 — Pre-training:** Agent trains vs heuristic opponent only. Heuristic priority: summon > sp.summon > battle > set > end. Evaluates every 50k steps.
+**Phase 1 — Pre-training:** Agent trains vs heuristic opponent only (diverse decks from pool). Evaluates every 50k steps.
 
-**Phase 2 — Frozen-pool self-play** (activates when 3 consecutive evals ≥ 75% vs heuristic):
-- 60% heuristic opponent (anchor)
-- 20% frozen recent checkpoint (sampled from last 5)
-- 20% frozen older checkpoint (sampled from full pool)
-- **Regression gate at 70%:** deactivates self-play if heuristic WR drops below
+**Phase 2 — Frozen-pool self-play** (activates when eval ≥ 70% vs heuristic):
+- 40% heuristic opponent (diverse deck from pool)
+- 30% frozen recent checkpoint (mirror deck)
+- 30% frozen older checkpoint (mirror deck)
+- **Regression gate at 60%:** deactivates self-play if heuristic WR drops below
+- Per-episode opponent roll (consistent opponent within each game)
 
-**Curriculum:** Starts with Goat Control mirror match, adds decks as win rate plateaus: Dragons → Warrior Toolbox → Thunder Dragon Chaos → Chaos Control → Reasoning Gate → Empty Jar. Mirror deck keeps 70% sampling weight.
+All 7 decks available from start (no curriculum). Heuristic games use diverse decks, checkpoint games use mirror matches.
 
 ## Baseline Opponent (Heuristic)
 
@@ -477,6 +517,22 @@ Removed curriculum system. All decks available from start.
 ### Issue 71: No card-to-card interaction modeling (architectural limitation)
 **Problem:** The MLP-based embedding stream flattened all card slots into one vector and compressed blindly. It couldn't learn relationships like "I have MST in hand AND opponent has a face-down S/T" or "tribute this monster to summon that one."
 **Fix:** Replaced linear compression with a 2-layer TransformerEncoder (4 attention heads) over the 121 card slots. Added learned segment embeddings so attention distinguishes board cards from action cards. Cards now attend to each other before the representation is projected.
+
+## Session 16 — Mar 3-5 (Rich Action Encoding + Three-Segment Transformer)
+
+### Issue 72: Actions lack semantic information (plateau at ~72%)
+**Problem:** Each action slot was just a card ID — the agent didn't know *what type* of action it is (summon vs activate vs attack), *where* the card is (hand, field, grave), or the card's *stats* (ATK, DEF). The agent plateaued at ~72% vs heuristic for millions of steps with the old architecture.
+**Fix:** Replaced flat `action_cards` (71,) with rich `action_features` (71, 12) encoding card ID, 7 action type one-hots, ATK/DEF/level, and card location per action slot.
+
+### Issue 73: Action history too sparse (no card identity)
+**Problem:** Old action history (10 actions × 5 features in flat observation) had no card IDs — just player + 4 action type flags. The agent couldn't distinguish which card was summoned or activated, making the history nearly useless for strategic reasoning.
+**Fix:** Added structured `action_history` (16, 10) with card embedding IDs, player, action types, ATK/DEF stats, and temporal distance (turns_ago). Removed old 50-dim history from flat features (503 → 453).
+
+### Issue 74: Flatten+project bottleneck (~992K params, rigid)
+**Problem:** The two-stream extractor flattened 121 transformer outputs into a fixed 3,872-dim vector, then projected to 256 via a single linear layer. This was parameter-heavy (~992K params for one layer) and couldn't handle variable-length sequences well — padding positions contributed noise despite masking.
+**Fix:** Three-segment transformer with segment-aware masked mean pooling. Board (50), action (71), and history (16) tokens each get their own projection to d_model=64, share a TransformerEncoder (4 heads, 2 layers), then pool separately per segment. Pooled segments concatenated (192) → Linear(192, 256). ~49K params for pooling vs ~992K.
+
+**Result:** 86% win rate vs heuristic at 5M steps (old architecture: 72% plateau at 8.8M steps). Floor lifted from ~70% to ~78%.
 
 ---
 
