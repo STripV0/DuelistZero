@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 
 from duelist_zero.env.goat_env import GoatEnv
-from duelist_zero.env.observation import OBSERVATION_DIM, CARD_ID_DIM, ACTION_CARD_DIM
+from duelist_zero.env.observation import (
+    OBSERVATION_DIM, CARD_ID_DIM,
+    ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM,
+    HISTORY_LENGTH, HISTORY_FEATURES_DIM,
+)
 from duelist_zero.env.action_space import ACTION_DIM
 
 
@@ -22,7 +26,8 @@ class TestReset:
     def test_reset_returns_valid_obs(self, env):
         obs, info = env.reset(seed=42)
         assert isinstance(obs, dict), f"Expected dict obs, got {type(obs)}"
-        assert "features" in obs and "card_ids" in obs and "action_cards" in obs
+        assert "features" in obs and "card_ids" in obs
+        assert "action_features" in obs and "action_history" in obs
         assert obs["features"].shape == (OBSERVATION_DIM,)
         assert obs["features"].dtype == np.float32
         assert np.all(obs["features"] >= -1.0), "Features has values < -1"
@@ -30,9 +35,10 @@ class TestReset:
         assert obs["card_ids"].shape == (CARD_ID_DIM,)
         assert obs["card_ids"].dtype == np.float32
         assert np.all(obs["card_ids"] >= 0.0), "Card IDs has values < 0"
-        assert obs["action_cards"].shape == (ACTION_CARD_DIM,)
-        assert obs["action_cards"].dtype == np.float32
-        assert np.all(obs["action_cards"] >= 0.0), "Action cards has values < 0"
+        assert obs["action_features"].shape == (ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM)
+        assert obs["action_features"].dtype == np.float32
+        assert obs["action_history"].shape == (HISTORY_LENGTH, HISTORY_FEATURES_DIM)
+        assert obs["action_history"].dtype == np.float32
 
     def test_reset_returns_info_dict(self, env):
         _, info = env.reset(seed=1)
@@ -47,7 +53,8 @@ class TestReset:
         # Different seeds → different observations (usually)
         assert obs1["features"].shape == obs2["features"].shape == (OBSERVATION_DIM,)
         assert obs1["card_ids"].shape == obs2["card_ids"].shape == (CARD_ID_DIM,)
-        assert obs1["action_cards"].shape == obs2["action_cards"].shape == (ACTION_CARD_DIM,)
+        assert obs1["action_features"].shape == obs2["action_features"].shape == (ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM)
+        assert obs1["action_history"].shape == obs2["action_history"].shape == (HISTORY_LENGTH, HISTORY_FEATURES_DIM)
 
 
 class TestActionMask:
@@ -80,7 +87,8 @@ class TestStep:
         assert obs["features"].shape == (OBSERVATION_DIM,)
         assert obs["features"].dtype == np.float32
         assert obs["card_ids"].shape == (CARD_ID_DIM,)
-        assert obs["action_cards"].shape == (ACTION_CARD_DIM,)
+        assert obs["action_features"].shape == (ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM)
+        assert obs["action_history"].shape == (HISTORY_LENGTH, HISTORY_FEATURES_DIM)
         assert -1.0 <= reward <= 1.0, f"Unexpected reward: {reward}"
         assert isinstance(terminated, bool)
         assert isinstance(truncated, bool)

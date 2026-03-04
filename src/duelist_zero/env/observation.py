@@ -4,30 +4,22 @@ Observation encoder for the GoatEnv.
 Converts a GameState into a flat float32 numpy array that the RL agent
 can consume. All values are normalized to [0, 1] or [-1, 1].
 
-Layout (OBSERVATION_DIM total):
-  [0]     my LP / 8000
-  [1]     opp LP / 8000
-  [2]     my hand size / 10
-  [3]     opp hand size / 10
-  [4]     my deck count / 40
-  [5]     opp deck count / 40
-  [6]     my GY count / 40
-  [7]     opp GY count / 40
-  [8]     my banished / 40
-  [9]     opp banished / 40
-  [10-17] phase one-hot (8 phases)
-  [18]    turn player flag (1 if my turn)
-  [19]    turn count / 40
-  [20]    LP advantage (my_lp - opp_lp) / 8000, clipped [-1, 1]
-  [21]    monster count advantage / 5, clipped [-1, 1]
-  [22]    total ATK advantage / 10000, clipped [-1, 1]
-  [23-82] my monster zone: 5 slots × 12 features
-  [83-112] my spell/trap zone: 5 slots × 6 features
-  [113-172] opp monster zone: 5 slots × 12 features
-  [173-202] opp spell/trap zone: 5 slots × 6 features
-  [203-282] my hand: 10 slots × 8 features
-  [283-332] recent actions: 10 × 5 features
-  [333-352] deck identity one-hot (20 slots, first 7 = DECK_ORDER)
+Layout (OBSERVATION_DIM = 453):
+  [0-9]     scalars (LP, hand, deck, GY, banished × 2)
+  [10-17]   phase one-hot (8 phases)
+  [18]      turn player flag
+  [19]      turn count / 40
+  [20-22]   relative advantages (LP, monster count, ATK)
+  [23-102]  my monster zone: 5 × 16
+  [103-152] my spell/trap zone: 5 × 10
+  [153-232] opp monster zone: 5 × 16
+  [233-282] opp spell/trap zone: 5 × 10
+  [283-432] my hand: 10 × 15
+  [433-452] deck identity one-hot (20)
+
+Separate observation keys:
+  action_features: (71, 12) — rich per-action features with card IDs, types, stats
+  action_history:  (16, 10) — structured history with card IDs and types
 """
 
 import sqlite3
@@ -49,15 +41,12 @@ _PHASE_DIM = 8            # phase one-hot
 _TURN_DIM = 1             # turn player flag
 _GAME_PROGRESS_DIM = 1    # turn count / 40
 _RELATIVE_DIM = 3         # LP advantage, monster count advantage, ATK advantage
-_MONSTER_SLOT_DIM = 12    # features per monster zone slot
-_SPELL_SLOT_DIM = 6       # features per spell/trap zone slot
-_HAND_SLOT_DIM = 8        # features per hand card slot
-_ACTION_HIST_DIM = 5      # features per action history entry
-
+_MONSTER_SLOT_DIM = 16    # features per monster zone slot
+_SPELL_SLOT_DIM = 10      # features per spell/trap zone slot
+_HAND_SLOT_DIM = 15       # features per hand card slot
 _MONSTER_ZONE_DIM = 5 * _MONSTER_SLOT_DIM   # 60
 _SPELL_ZONE_DIM = 5 * _SPELL_SLOT_DIM        # 30
 _HAND_DIM = 10 * _HAND_SLOT_DIM              # 80
-_ACTION_HIST_TOTAL = 10 * _ACTION_HIST_DIM   # 50
 
 MAX_DECKS = 20                               # capacity for deck identity one-hot
 _DECK_ID_DIM = MAX_DECKS                     # 20
@@ -71,10 +60,17 @@ OBSERVATION_DIM = (
     2 * _MONSTER_ZONE_DIM +   # my + opp
     2 * _SPELL_ZONE_DIM +     # my + opp
     _HAND_DIM +
-    _ACTION_HIST_TOTAL +
     _DECK_ID_DIM
 )
-# = 10 + 8 + 1 + 1 + 3 + 120 + 60 + 80 + 50 + 20 = 353
+# = 10 + 8 + 1 + 1 + 3 + 160 + 100 + 150 + 20 = 453
+
+# Rich action features: 12 features per action slot
+ACTION_FEATURES_DIM = 12
+ACTION_FEATURES_SLOTS = 71
+
+# Structured action history: 10 features per entry, 16 entries
+HISTORY_LENGTH = 16
+HISTORY_FEATURES_DIM = 10
 
 # Card ID observation: 50 slots for embedding lookup
 # [0-4] my monsters, [5-9] my S/T, [10-14] opp monsters (face-up only),
@@ -93,8 +89,14 @@ _PHASE_ORDER = [
     PHASE.BATTLE, PHASE.MAIN2, PHASE.END,
 ]
 
-# Action type index mapping for history
-_ACTION_TYPES = ["summon", "set", "activate", "attack", "draw"]
+# Location encoding for action features
+_LOCATION_ENCODING = {
+    LOCATION.HAND: 0.2,
+    LOCATION.MZONE: 0.4,
+    LOCATION.SZONE: 0.6,
+    LOCATION.GRAVE: 0.8,
+    LOCATION.REMOVED: 1.0,
+}
 
 
 # ============================================================
@@ -139,9 +141,10 @@ class CardDB:
 # ============================================================
 def _encode_monster_slot(card: Optional[ZoneCard], db: Optional[CardDB], visible: bool) -> np.ndarray:
     """
-    Encode a single monster zone slot into 12 floats.
-    [occupied, face_up, atk_pos, atk/2000, def/2000, level/12,
-     is_monster, is_spell, is_trap, attr_dark, attr_light, attr_other]
+    Encode a single monster zone slot into 16 floats.
+    [occupied, face_up, atk_pos, atk/5000, def/5000, level/12,
+     is_monster, is_spell, is_trap, attr_dark, attr_light, attr_other,
+     is_effect, is_flip, is_fusion, is_ritual]
     """
     v = np.zeros(_MONSTER_SLOT_DIM, dtype=np.float32)
     if card is None:
@@ -165,13 +168,18 @@ def _encode_monster_slot(card: Optional[ZoneCard], db: Optional[CardDB], visible
             v[9] = float(bool(data["attribute"] & ATTRIBUTE.DARK))
             v[10] = float(bool(data["attribute"] & ATTRIBUTE.LIGHT))
             v[11] = float(bool(data["attribute"] & ~(ATTRIBUTE.DARK | ATTRIBUTE.LIGHT)))
+            v[12] = float(bool(data["type"] & TYPE.EFFECT))
+            v[13] = float(bool(data["type"] & TYPE.FLIP))
+            v[14] = float(bool(data["type"] & TYPE.FUSION))
+            v[15] = float(bool(data["type"] & TYPE.RITUAL))
     return v
 
 
 def _encode_spell_slot(card: Optional[ZoneCard], db: Optional[CardDB], visible: bool) -> np.ndarray:
     """
-    Encode a single spell/trap zone slot into 6 floats.
-    [occupied, face_up, is_spell, is_trap, is_continuous, is_equip]
+    Encode a single spell/trap zone slot into 10 floats.
+    [occupied, face_up, is_spell, is_trap, is_continuous, is_equip,
+     is_quickplay, is_field, is_counter, is_ritual]
     """
     v = np.zeros(_SPELL_SLOT_DIM, dtype=np.float32)
     if card is None:
@@ -188,13 +196,18 @@ def _encode_spell_slot(card: Optional[ZoneCard], db: Optional[CardDB], visible: 
             v[3] = float(bool(data["type"] & TYPE.TRAP))
             v[4] = float(bool(data["type"] & TYPE.CONTINUOUS))
             v[5] = float(bool(data["type"] & TYPE.EQUIP))
+            v[6] = float(bool(data["type"] & TYPE.QUICKPLAY))
+            v[7] = float(bool(data["type"] & TYPE.FIELD))
+            v[8] = float(bool(data["type"] & TYPE.COUNTER))
+            v[9] = float(bool(data["type"] & TYPE.RITUAL))
     return v
 
 
 def _encode_hand_card(code: int, db: Optional[CardDB]) -> np.ndarray:
     """
-    Encode a single hand card into 8 floats.
-    [level/12, atk/5000, def/5000, is_monster, is_spell, is_trap, attr_dark, attr_light]
+    Encode a single hand card into 15 floats.
+    [level/12, atk/5000, def/5000, is_monster, is_spell, is_trap, attr_dark, attr_light,
+     is_effect, is_flip, is_fusion, is_ritual, is_quickplay, is_field, is_counter]
     """
     v = np.zeros(_HAND_SLOT_DIM, dtype=np.float32)
     if code == 0 or db is None:
@@ -210,24 +223,173 @@ def _encode_hand_card(code: int, db: Optional[CardDB]) -> np.ndarray:
         v[5] = float(bool(data["type"] & TYPE.TRAP))
         v[6] = float(bool(data["attribute"] & ATTRIBUTE.DARK))
         v[7] = float(bool(data["attribute"] & ATTRIBUTE.LIGHT))
+        v[8] = float(bool(data["type"] & TYPE.EFFECT))
+        v[9] = float(bool(data["type"] & TYPE.FLIP))
+        v[10] = float(bool(data["type"] & TYPE.FUSION))
+        v[11] = float(bool(data["type"] & TYPE.RITUAL))
+        v[12] = float(bool(data["type"] & TYPE.QUICKPLAY))
+        v[13] = float(bool(data["type"] & TYPE.FIELD))
+        v[14] = float(bool(data["type"] & TYPE.COUNTER))
     return v
 
 
-def _encode_action(action) -> np.ndarray:
+def _encode_location(loc: int) -> float:
+    """Encode a LOCATION bitmask to a scalar."""
+    for flag, val in _LOCATION_ENCODING.items():
+        if loc & flag:
+            return val
+    return 0.0
+
+
+def _encode_action_slot(
+    card_code: int,
+    action_type: int,
+    location: int,
+    card_index: 'CardIndex',
+    db: Optional[CardDB],
+) -> np.ndarray:
     """
-    Encode a single ActionRecord into 5 floats.
-    [player, is_summon, is_set, is_activate, is_attack]
+    Encode a single action slot into ACTION_FEATURES_DIM (12) floats.
+    [card_id, is_summon, is_spsummon, is_set, is_activate, is_attack,
+     is_reposition, is_phase_pass_other, ATK/5000, DEF/5000, level/12, location]
     """
-    from ..engine.game_state import ActionRecord
-    v = np.zeros(_ACTION_HIST_DIM, dtype=np.float32)
-    if action is None:
-        return v
-    v[0] = float(action.player)
-    v[1] = float(action.action_type == "summon")
-    v[2] = float(action.action_type == "set")
-    v[3] = float(action.action_type == "activate")
-    v[4] = float(action.action_type == "attack")
+    v = np.zeros(ACTION_FEATURES_DIM, dtype=np.float32)
+    if card_code != 0:
+        v[0] = float(card_index.code_to_index(card_code))
+    v[action_type] = 1.0  # action_type is col index 1-7
+    if card_code != 0 and db is not None:
+        data = db.get(card_code & 0x7FFFFFFF)
+        if data:
+            v[8] = min(data["atk"], 5000) / 5000.0 if data["atk"] >= 0 else 0.0
+            v[9] = min(data["def"], 5000) / 5000.0 if data["def"] >= 0 else 0.0
+            v[10] = min(data["level"], 12) / 12.0
+    v[11] = _encode_location(location)
     return v
+
+
+# Action type column indices for action_features
+_ACT_SUMMON = 1
+_ACT_SPSUMMON = 2
+_ACT_SET = 3
+_ACT_ACTIVATE = 4
+_ACT_ATTACK = 5
+_ACT_REPOSITION = 6
+_ACT_OTHER = 7
+
+
+def encode_action_features(
+    msg,
+    card_index: 'CardIndex',
+    db: Optional[CardDB] = None,
+) -> np.ndarray:
+    """
+    Encode rich per-action features for all 71 action slots.
+
+    Returns float32 array of shape (ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM).
+    """
+    from ..core.message_parser import (
+        MsgSelectIdleCmd,
+        MsgSelectBattleCmd,
+        MsgSelectCard,
+        MsgSelectChain,
+        MsgSelectEffectYn,
+        MsgSelectTribute,
+    )
+
+    arr = np.zeros((ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM), dtype=np.float32)
+    if msg is None:
+        return arr
+
+    if isinstance(msg, MsgSelectIdleCmd):
+        for i, c in enumerate(msg.summonable[:5]):
+            arr[0 + i] = _encode_action_slot(c.code, _ACT_SUMMON, c.location, card_index, db)
+        for i, c in enumerate(msg.spsummonable[:5]):
+            arr[5 + i] = _encode_action_slot(c.code, _ACT_SPSUMMON, c.location, card_index, db)
+        for i, c in enumerate(msg.setable_monsters[:5]):
+            arr[10 + i] = _encode_action_slot(c.code, _ACT_SET, c.location, card_index, db)
+        for i, c in enumerate(msg.setable_st[:5]):
+            arr[15 + i] = _encode_action_slot(c.code, _ACT_SET, c.location, card_index, db)
+        for i, c in enumerate(msg.activatable[:10]):
+            arr[20 + i] = _encode_action_slot(c.code, _ACT_ACTIVATE, c.location, card_index, db)
+        for i, c in enumerate(msg.repositionable[:5]):
+            arr[30 + i] = _encode_action_slot(c.code, _ACT_REPOSITION, c.location, card_index, db)
+        # toBP (35), toEP (36) — phase transitions
+        if msg.can_battle_phase:
+            arr[35, _ACT_OTHER] = 1.0
+        if msg.can_end_phase:
+            arr[36, _ACT_OTHER] = 1.0
+
+    elif isinstance(msg, MsgSelectBattleCmd):
+        for i, a in enumerate(msg.attackable[:5]):
+            if a.card is not None:
+                arr[37 + i] = _encode_action_slot(
+                    a.card.code, _ACT_ATTACK, a.card.location, card_index, db
+                )
+        for i, c in enumerate(msg.activatable[:5]):
+            arr[42 + i] = _encode_action_slot(c.code, _ACT_ACTIVATE, c.location, card_index, db)
+        # toM2 (47), toEP (48)
+        if msg.can_main2:
+            arr[47, _ACT_OTHER] = 1.0
+        if msg.can_end_phase:
+            arr[48, _ACT_OTHER] = 1.0
+
+    elif isinstance(msg, (MsgSelectCard, MsgSelectTribute)):
+        for i, c in enumerate(msg.cards[:10]):
+            arr[51 + i] = _encode_action_slot(c.code, _ACT_OTHER, c.location, card_index, db)
+
+    elif isinstance(msg, MsgSelectChain):
+        for i, c in enumerate(msg.cards[:10]):
+            arr[51 + i] = _encode_action_slot(c.code, _ACT_ACTIVATE, c.location, card_index, db)
+
+    elif isinstance(msg, MsgSelectEffectYn):
+        arr[49] = _encode_action_slot(msg.code, _ACT_ACTIVATE, msg.location, card_index, db)
+
+    # Yes/No (49, 50), position (61, 62), options (63-70) are left as zeros
+    # unless populated above — these are utility actions with no card info
+
+    return arr
+
+
+def encode_action_history(
+    state: GameState,
+    perspective: int,
+    card_index: 'CardIndex',
+    db: Optional[CardDB] = None,
+) -> np.ndarray:
+    """
+    Encode structured action history.
+
+    Returns float32 array of shape (HISTORY_LENGTH, HISTORY_FEATURES_DIM).
+    Right-aligned: most recent action at the end.
+    """
+    arr = np.zeros((HISTORY_LENGTH, HISTORY_FEATURES_DIM), dtype=np.float32)
+    recent = state.get_recent_actions(HISTORY_LENGTH)
+
+    # Right-align: pad start with zeros
+    offset = HISTORY_LENGTH - len(recent)
+    current_turn = state.current_turn
+
+    for i, action in enumerate(recent):
+        v = arr[offset + i]
+        if action.card_code != 0:
+            v[0] = float(card_index.code_to_index(action.card_code))
+        # Encode player relative to perspective
+        v[1] = float(action.player != perspective)  # 0=me, 1=opponent
+        v[2] = float(action.action_type == "summon")
+        v[3] = float(action.action_type == "set")
+        v[4] = float(action.action_type == "activate")
+        v[5] = float(action.action_type == "attack")
+        v[6] = float(action.action_type == "draw")
+        # Card stats
+        if action.card_code != 0 and db is not None:
+            data = db.get(action.card_code & 0x7FFFFFFF)
+            if data:
+                v[7] = min(data["atk"], 5000) / 5000.0 if data["atk"] >= 0 else 0.0
+                v[8] = min(data["def"], 5000) / 5000.0 if data["def"] >= 0 else 0.0
+        # Turns ago
+        v[9] = min(max(current_turn - action.turn, 0), 40) / 40.0
+
+    return arr
 
 
 # ============================================================
@@ -337,14 +499,6 @@ def encode_observation(
         code = hand[i] if i < len(hand) else 0
         obs[idx:idx + _HAND_SLOT_DIM] = _encode_hand_card(code, db)
         idx += _HAND_SLOT_DIM
-
-    # --- Recent action history (last 10) ---
-    recent = state.get_recent_actions(10)
-    # Pad to 10
-    recent = [None] * (10 - len(recent)) + list(recent)
-    for action in recent:
-        obs[idx:idx + _ACTION_HIST_DIM] = _encode_action(action)
-        idx += _ACTION_HIST_DIM
 
     # --- Deck identity one-hot ---
     if 0 <= deck_id < MAX_DECKS:

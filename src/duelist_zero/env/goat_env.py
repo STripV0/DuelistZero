@@ -53,13 +53,44 @@ from ..core.message_parser import (
 from ..engine.duel import Duel, load_deck
 from ..engine.game_state import GameState
 from .observation import (
-    encode_observation, encode_card_ids, encode_action_cards,
-    CardDB, OBSERVATION_DIM, CARD_ID_DIM, ACTION_CARD_DIM,
+    encode_observation, encode_card_ids, encode_action_features, encode_action_history,
+    CardDB, OBSERVATION_DIM, CARD_ID_DIM,
+    ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM,
+    HISTORY_LENGTH, HISTORY_FEATURES_DIM,
 )
 from .card_index import CardIndex
 from .action_space import ActionSpace, ACTION_DIM, _respond_select_place
 from .reward import compute_reward
 from .heuristic import heuristic_action
+
+
+class _RecurrentOpponentFn:
+    """Stateful wrapper for recurrent (LSTM) model opponents.
+
+    Tracks LSTM hidden state across decisions within an episode.
+    Call reset() at the start of each new episode.
+    """
+
+    def __init__(self, model, deterministic: bool = False):
+        self.model = model
+        self.deterministic = deterministic
+        self.state = None
+        self.episode_start = np.array([True])
+
+    def reset(self):
+        self.state = None
+        self.episode_start = np.array([True])
+
+    def __call__(self, obs, mask):
+        action, self.state = self.model.predict(
+            obs,
+            state=self.state,
+            episode_start=self.episode_start,
+            action_masks=mask,
+            deterministic=self.deterministic,
+        )
+        self.episode_start = np.array([False])
+        return int(action)
 
 
 # ============================================================
@@ -136,10 +167,16 @@ class GoatEnv(gym.Env):
                 shape=(CARD_ID_DIM,),
                 dtype=np.float32,
             ),
-            "action_cards": spaces.Box(
+            "action_features": spaces.Box(
                 low=0.0,
                 high=float(self._card_index.vocab_size - 1),
-                shape=(ACTION_CARD_DIM,),
+                shape=(ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM),
+                dtype=np.float32,
+            ),
+            "action_history": spaces.Box(
+                low=0.0,
+                high=float(self._card_index.vocab_size - 1),
+                shape=(HISTORY_LENGTH, HISTORY_FEATURES_DIM),
                 dtype=np.float32,
             ),
         })
@@ -208,30 +245,26 @@ class GoatEnv(gym.Env):
         if self._opponent_mode == "mixed":
             # Roll opponent type for this episode
             r = np.random.random()
-            if r < 0.60:
+            if r < 0.40:
                 # Heuristic with diverse deck from pool
                 self._opponent_fn = None
                 opp_deck = self._pick_diverse_deck()
-            elif r < 0.80:
+            elif r < 0.70:
                 # Recent frozen checkpoint with mirror deck
-                model = self._opponent_models.get("recent")
-                if model is not None:
-                    def _fn(obs, mask, m=model):
-                        action, _ = m.predict(obs, action_masks=mask, deterministic=False)
-                        return int(action)
-                    self._opponent_fn = _fn
+                opp = self._opponent_models.get("recent")
+                if opp is not None:
+                    opp.reset()  # Reset LSTM state for new episode
+                    self._opponent_fn = opp
                 else:
                     self._opponent_fn = None
                 opp_deck = self._agent_deck  # mirror
                 self._opp_deck_idx = self._agent_deck_idx
             else:
                 # Older frozen checkpoint with mirror deck
-                model = self._opponent_models.get("older")
-                if model is not None:
-                    def _fn(obs, mask, m=model):
-                        action, _ = m.predict(obs, action_masks=mask, deterministic=False)
-                        return int(action)
-                    self._opponent_fn = _fn
+                opp = self._opponent_models.get("older")
+                if opp is not None:
+                    opp.reset()  # Reset LSTM state for new episode
+                    self._opponent_fn = opp
                 else:
                     self._opponent_fn = None
                 opp_deck = self._agent_deck  # mirror
@@ -241,7 +274,9 @@ class GoatEnv(gym.Env):
             self._opponent_fn = None
             opp_deck = self._pick_diverse_deck()
         else:
-            # "model" mode — mirror deck
+            # "model" mode — mirror deck, reset LSTM state
+            if hasattr(self._opponent_fn, "reset"):
+                self._opponent_fn.reset()
             opp_deck = self._agent_deck
             self._opp_deck_idx = self._agent_deck_idx
 
@@ -443,8 +478,8 @@ class GoatEnv(gym.Env):
         Modes:
             "heuristic": Heuristic opponent with diverse decks from pool.
             "model": Single checkpoint opponent with mirror deck.
-            "mixed": Per-episode roll — 60% heuristic (diverse deck),
-                     20% recent frozen (mirror), 20% older frozen (mirror).
+            "mixed": Per-episode roll — 40% heuristic (diverse deck),
+                     30% recent frozen (mirror), 30% older frozen (mirror).
 
         Args:
             mode: One of "heuristic", "model", "mixed".
@@ -457,28 +492,29 @@ class GoatEnv(gym.Env):
             self._opponent_models = {}
             return
 
-        from sb3_contrib import MaskablePPO as _MaskablePPO
+        from ..training.maskable_recurrent_ppo import MaskableRecurrentPPO
 
         if mode == "model":
             assert model_path is not None
-            opp_model = _MaskablePPO.load(model_path)
-
-            def model_fn(obs, mask):
-                action, _ = opp_model.predict(obs, action_masks=mask, deterministic=False)
-                return int(action)
-
-            self._opponent_fn = model_fn
+            opp_model = MaskableRecurrentPPO.load(model_path)
+            self._opponent_fn = _RecurrentOpponentFn(opp_model)
             self._opponent_mode = "model"
             self._opponent_models = {}
 
         elif mode == "mixed":
-            # Load models once, store for per-episode selection in reset()
-            recent_model = _MaskablePPO.load(model_path) if model_path else None
-            older_model = _MaskablePPO.load(past_path) if past_path else None
+            # Load models once, wrap with stateful LSTM tracking
+            recent = (
+                _RecurrentOpponentFn(MaskableRecurrentPPO.load(model_path))
+                if model_path else None
+            )
+            older = (
+                _RecurrentOpponentFn(MaskableRecurrentPPO.load(past_path))
+                if past_path else None
+            )
             self._opponent_mode = "mixed"
             self._opponent_models = {
-                "recent": recent_model,
-                "older": older_model,
+                "recent": recent,
+                "older": older,
             }
 
     # ============================================================
@@ -558,9 +594,16 @@ class GoatEnv(gym.Env):
                     perspective=opp_perspective,
                     card_index=self._card_index,
                 ),
-                "action_cards": encode_action_cards(
+                "action_features": encode_action_features(
                     msg,
                     self._card_index,
+                    db=self._card_db,
+                ),
+                "action_history": encode_action_history(
+                    duel.state,
+                    perspective=opp_perspective,
+                    card_index=self._card_index,
+                    db=self._card_db,
                 ),
             }
             action = self._opponent_fn(opp_obs, mask)
@@ -588,7 +631,12 @@ class GoatEnv(gym.Env):
             return {
                 "features": np.zeros(OBSERVATION_DIM, dtype=np.float32),
                 "card_ids": np.zeros(CARD_ID_DIM, dtype=np.float32),
-                "action_cards": np.zeros(ACTION_CARD_DIM, dtype=np.float32),
+                "action_features": np.zeros(
+                    (ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM), dtype=np.float32
+                ),
+                "action_history": np.zeros(
+                    (HISTORY_LENGTH, HISTORY_FEATURES_DIM), dtype=np.float32
+                ),
             }
         return {
             "features": encode_observation(
@@ -602,9 +650,16 @@ class GoatEnv(gym.Env):
                 perspective=self._agent_player,
                 card_index=self._card_index,
             ),
-            "action_cards": encode_action_cards(
+            "action_features": encode_action_features(
                 self._pending_msg,
                 self._card_index,
+                db=self._card_db,
+            ),
+            "action_history": encode_action_history(
+                self._duel.state,
+                perspective=self._agent_player,
+                card_index=self._card_index,
+                db=self._card_db,
             ),
         }
 

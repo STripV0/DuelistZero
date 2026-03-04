@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from sb3_contrib import MaskablePPO
 
 from ..core.message_parser import (
     MessageParser,
@@ -21,7 +20,10 @@ from ..core.message_parser import (
 from ..engine.duel import load_deck
 from ..engine.game_state import GameState, update_state
 from ..env.action_space import ActionSpace
-from ..env.observation import encode_observation, encode_card_ids, encode_action_cards, CardDB
+from ..env.observation import (
+    encode_observation, encode_card_ids, encode_action_features, encode_action_history,
+    CardDB,
+)
 from ..env.card_index import CardIndex
 from .protocol import (
     send_packet, recv_packet,
@@ -87,9 +89,22 @@ class EdoProBot:
         self.name = name
         self.version = version
 
-        # Load model
+        # Load model (try MaskableRecurrentPPO first, fall back to MaskablePPO)
         print(f"Loading model from {model_path}...")
-        self.model = MaskablePPO.load(str(model_path))
+        try:
+            from ..training.maskable_recurrent_ppo import MaskableRecurrentPPO
+            self.model = MaskableRecurrentPPO.load(str(model_path))
+            self._recurrent = True
+            print("Loaded as MaskableRecurrentPPO (LSTM)")
+        except Exception:
+            from sb3_contrib import MaskablePPO
+            self.model = MaskablePPO.load(str(model_path))
+            self._recurrent = False
+            print("Loaded as MaskablePPO (non-recurrent)")
+
+        # LSTM state tracking for recurrent models
+        self._lstm_state = None
+        self._episode_start = np.array([True])
 
         # Detect whether model uses dict or flat observations
         from gymnasium import spaces
@@ -253,8 +268,12 @@ class EdoProBot:
                     "card_ids": encode_card_ids(
                         self.state, perspective=self.my_player, card_index=self.card_index
                     ),
-                    "action_cards": encode_action_cards(
-                        msg, self.card_index
+                    "action_features": encode_action_features(
+                        msg, self.card_index, db=self.card_db
+                    ),
+                    "action_history": encode_action_history(
+                        self.state, perspective=self.my_player,
+                        card_index=self.card_index, db=self.card_db
                     ),
                 }
             else:
@@ -265,8 +284,20 @@ class EdoProBot:
             # Get valid action mask
             mask = self.action_space.get_mask(msg)
 
-            # Run model
-            action, _ = self.model.predict(obs, action_masks=mask, deterministic=True)
+            # Run model (with LSTM state tracking for recurrent models)
+            if self._recurrent:
+                action, self._lstm_state = self.model.predict(
+                    obs,
+                    state=self._lstm_state,
+                    episode_start=self._episode_start,
+                    action_masks=mask,
+                    deterministic=True,
+                )
+                self._episode_start = np.array([False])
+            else:
+                action, _ = self.model.predict(
+                    obs, action_masks=mask, deterministic=True
+                )
             action = int(action)
 
             # Clamp to valid actions
@@ -334,8 +365,10 @@ class EdoProBot:
         print("Duel starting! Sending deck...")
         send_packet(self.sock, CTOS_UPDATE_DECK,
                     build_update_deck(self.main_deck, self.extra_deck))
-        # Reset game state for the new duel
+        # Reset game state and LSTM state for the new duel
         self.state.reset()
+        self._lstm_state = None
+        self._episode_start = np.array([True])
 
     def _handle_duel_end(self):
         """Duel ended."""
