@@ -19,30 +19,51 @@
 
 ```
 Observation Dict
-  ├── "features"      (353,) float32  — game state features
+  ├── "features"      (503,) float32  — game state features
   ├── "card_ids"      (50,)  float32  — card identity indices
   └── "action_cards"  (71,)  float32  — card index per action slot
 
-CardEmbeddingExtractor:
+CardEmbeddingExtractor (Two-Stream + Transformer Attention):
+
   nn.Embedding(vocab_size=~14k, embed_dim=32, padding_idx=0)
+    └── optionally initialized from LLM-pretrained embeddings (.npy)
 
-  card_ids     → Embedding → flatten → (50 × 32 = 1,600)
-  action_cards → Embedding → flatten → (71 × 32 = 2,272)
-  features     → passthrough →          (353)
-                                         ─────
-  Concatenated:                          4,225
+  Stream A (features):
+    features → passthrough → (503)
 
-  Linear(4225, 512) → ReLU
-  Linear(512, 512)  → ReLU
-                       │
-              ┌────────┴────────┐
-         Policy Head       Value Head
-      Linear(512, 512)   Linear(512, 512)
-      Linear(512, 256)   Linear(512, 256)
-      Linear(256, 71)    Linear(256, 1)
+  Stream B (cards — transformer attention):
+    card_ids     → Embedding → (50, 32)  ─┐
+    action_cards → Embedding → (71, 32)  ─┤ + segment embeddings
+                                           ↓
+    Concatenate → (121, 32) → TransformerEncoder(2 layers, 4 heads)
+                            → flatten → (121 × 32 = 3,872)
+                            → Linear(3872, 256) → ReLU → (256)
+
+  Merge:
+    [Stream A (503) | Stream B (256)] = 759
+    → Linear(759, 512) → ReLU
+    → Linear(512, 512) → ReLU
+                           │
+                  ┌────────┴────────┐
+             Policy Head       Value Head
+          Linear(512, 512)   Linear(512, 512)
+          Linear(512, 256)   Linear(512, 256)
+          Linear(256, 71)    Linear(256, 1)
 ```
 
-## Observation Space (353 features)
+### LLM-Pretrained Card Embeddings
+
+Card embeddings can be pre-initialized from card text using sentence-transformers:
+
+1. Card name + effect text encoded with `all-MiniLM-L6-v2` (384-dim)
+2. PCA reduction to 32 dims (matching `embed_dim`)
+3. Saved as `data/card_embeddings.npy` (14,337 × 32, index 0 = zero padding)
+4. Loaded at model init, then fine-tuned during training
+
+Generate: `uv run --group embeddings python scripts/generate_card_embeddings.py`
+Train with: `--pretrained-embeddings data/card_embeddings.npy`
+
+## Observation Space (503 features)
 
 | Range | Description |
 |---|---|
@@ -51,13 +72,13 @@ CardEmbeddingExtractor:
 | [18] | Turn player flag |
 | [19] | Turn count / 40 |
 | [20-22] | Relative advantage: LP diff, monster count diff, ATK diff ([-1,1]) |
-| [23-82] | My monster zone: 5 slots × 12 features (occupied, face_up, atk_pos, atk, def, level, type, attribute) |
-| [83-112] | My spell/trap zone: 5 slots × 6 features |
-| [113-172] | Opp monster zone (face-down stats hidden) |
-| [173-202] | Opp spell/trap zone (face-down hidden) |
-| [203-282] | My hand: 10 slots × 8 features |
-| [283-332] | Action history: last 10 actions × 5 features |
-| [333-352] | Deck identity one-hot |
+| [23-102] | My monster zone: 5 slots × 16 features (occupied, face_up, atk_pos, atk, def, level, type×3, attribute×3, effect, flip, fusion, ritual) |
+| [103-152] | My spell/trap zone: 5 slots × 10 features (occupied, face_up, spell, trap, continuous, equip, quickplay, field, counter, ritual) |
+| [153-232] | Opp monster zone: 5 slots × 16 features (face-down stats hidden) |
+| [233-282] | Opp spell/trap zone: 5 slots × 10 features (face-down hidden) |
+| [283-432] | My hand: 10 slots × 15 features (level, atk, def, type×3, attribute×2, effect, flip, fusion, ritual, quickplay, field, counter) |
+| [433-482] | Action history: last 10 actions × 5 features |
+| [483-502] | Deck identity one-hot |
 
 Card IDs (50 slots): my field (10) + opp field face-up (10) + my hand (10) + my GY top 10 + opp GY top 10
 
@@ -430,6 +451,32 @@ No bugs. Short session for project exploration.
 - Heuristic games → diverse decks from full pool (7 decks)
 - Checkpoint games → mirror matches (same deck as agent)
 Removed curriculum system. All decks available from start.
+
+## Session 15 — Feb 27 (Two-Stream Architecture + Pretrained Embeddings + Attention)
+
+### Issue 67: Single-stream MLP drowns features in embeddings
+**Problem:** The extractor concatenated 353 continuous features with 3,872 embedding dims into a 4,225-dim vector, then compressed through a single MLP. Features represented only 8% of input — embeddings dominated, drowning out critical game-state signals like LP, board state, and phase.
+**Fix:** Two-stream architecture. Stream A passes features through directly. Stream B compresses embeddings separately. Merged before final MLP, giving features ~66% weight (503/759) instead of 8%.
+
+### Issue 68: Card embeddings randomly initialized
+**Problem:** `nn.Embedding` initialized randomly — the agent had to learn card identities from scratch via reward signal alone. With 14k+ cards, this is an enormous search space.
+**Fix:** Pre-initialize embeddings from card text using sentence-transformers (`all-MiniLM-L6-v2`, 384-dim → PCA to 32-dim). Cards with similar effects start with similar embeddings, giving the network a semantic head start. Embeddings remain trainable (fine-tuned during training).
+
+### Issue 69: Missing card subtype features in observation
+**Problem:** Continuous features encoded basic type (monster/spell/trap) but missed critical subtypes. Agent couldn't distinguish Quick-Play spells (activatable on opponent's turn) from Normal spells, or FLIP effects from regular effects, without relying solely on the embedding.
+**Fix:** Added 7 subtype flags across all card slot encoders:
+- Monster slots (12→16): +EFFECT, FLIP, FUSION, RITUAL
+- Spell/trap slots (6→10): +QUICKPLAY, FIELD, COUNTER, RITUAL
+- Hand cards (8→15): +EFFECT, FLIP, FUSION, RITUAL, QUICKPLAY, FIELD, COUNTER
+- OBSERVATION_DIM: 353 → 503
+
+### Issue 70: Mean-pooling bottleneck in transformer stream
+**Problem:** Initial transformer implementation mean-pooled 121 card slots (50 board + 71 action) down to a single 32-dim vector. Compressing the entire game state (both fields, hands, graveyards) into 32 numbers threw away massive amounts of information.
+**Fix:** Replace mean pool with flatten (121×32 = 3,872 dims) → Linear projection to 256. The transformer learns card-to-card interactions, then the projection preserves a much richer representation.
+
+### Issue 71: No card-to-card interaction modeling (architectural limitation)
+**Problem:** The MLP-based embedding stream flattened all card slots into one vector and compressed blindly. It couldn't learn relationships like "I have MST in hand AND opponent has a face-down S/T" or "tribute this monster to summon that one."
+**Fix:** Replaced linear compression with a 2-layer TransformerEncoder (4 attention heads) over the 121 card slots. Added learned segment embeddings so attention distinguishes board cards from action cards. Cards now attend to each other before the representation is projected.
 
 ---
 
