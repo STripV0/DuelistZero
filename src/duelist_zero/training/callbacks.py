@@ -10,7 +10,7 @@ import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 from ..env.goat_env import GoatEnv
-from .eval import EloTracker, evaluate
+from .eval import EloTracker, RecurrentAgentFn, evaluate
 
 
 class SelfPlayCallback(BaseCallback):
@@ -35,9 +35,9 @@ class SelfPlayCallback(BaseCallback):
         save_dir: str = "checkpoints",
         eval_episodes: int = 200,
         no_self_play: bool = False,
-        self_play_threshold: float = 0.75,
-        self_play_window: int = 3,
-        regression_gate: float = 0.70,
+        self_play_threshold: float = 0.70,
+        self_play_window: int = 1,
+        regression_gate: float = 0.60,
         heuristic_limit: int = 5_000_000,
         verbose: int = 1,
     ):
@@ -165,7 +165,7 @@ class SelfPlayCallback(BaseCallback):
                 past_path=str(older_path),
             )
             if self.verbose:
-                print(f"[SelfPlay] 60% heuristic (diverse) + 20% {recent_id} (mirror) + 20% {older_id} (mirror)")
+                print(f"[SelfPlay] 40% heuristic (diverse) + 30% {recent_id} (mirror) + 30% {older_id} (mirror)")
         else:
             # Heuristic-only with diverse decks
             self._broadcast_opponent(mode="heuristic")
@@ -205,28 +205,22 @@ class SelfPlayCallback(BaseCallback):
             env.set_opponent_from_path(mode=mode, model_path=model_path, past_path=past_path)
 
     def _make_agent_fn(self):
-        """Create an agent function from the current model."""
-        model = self.model
+        """Create an agent function from the current model.
 
-        def agent_fn(obs, mask):
-            action, _ = model.predict(obs, action_masks=mask, deterministic=True)
-            return int(action)
-
-        return agent_fn
+        Returns a RecurrentAgentFn that tracks LSTM state across steps
+        within each episode (reset() called automatically by evaluate()).
+        """
+        return RecurrentAgentFn(self.model, deterministic=True)
 
     def _make_opponent_fn(self, model_path: Path, deterministic: bool = False):
-        """Create an opponent function from a saved checkpoint."""
-        from sb3_contrib import MaskablePPO
+        """Create an opponent function from a saved checkpoint.
 
-        opp_model = MaskablePPO.load(str(model_path))
+        Returns a RecurrentAgentFn that tracks LSTM state for the opponent.
+        """
+        from .maskable_recurrent_ppo import MaskableRecurrentPPO
 
-        def opponent_fn(obs, mask):
-            action, _ = opp_model.predict(
-                obs, action_masks=mask, deterministic=deterministic,
-            )
-            return int(action)
-
-        return opponent_fn
+        opp_model = MaskableRecurrentPPO.load(str(model_path))
+        return RecurrentAgentFn(opp_model, deterministic=deterministic)
 
     def _sample_recent_opponent(
         self, exclude: Optional[str] = None, window: int = 5,

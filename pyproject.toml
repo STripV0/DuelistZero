@@ -30,3 +30,7 @@ packages = ["src/duelist_zero"]
 dev = [
     "pytest>=9.0.2",
 ]
+embeddings = [
+    "sentence-transformers>=2.2.0",
+    "scikit-learn>=1.3.0",
+]

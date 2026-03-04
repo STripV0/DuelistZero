@@ -4,6 +4,7 @@ Evaluation utilities for measuring agent strength.
 Provides:
 - Win-rate evaluation against random / trained opponents
 - ELO rating system for checkpoint tracking
+- RecurrentAgentFn for LSTM-based agent evaluation
 """
 
 import json
@@ -14,13 +15,49 @@ from typing import Optional
 import numpy as np
 
 
+class RecurrentAgentFn:
+    """
+    Stateful wrapper for recurrent (LSTM) model inference.
+
+    Tracks LSTM hidden state across steps within an episode. Call reset()
+    at the start of each new episode to zero the LSTM state.
+
+    Compatible with evaluate() — implements __call__(obs, mask) -> action
+    and reset() for episode boundaries.
+    """
+
+    def __init__(self, model, deterministic: bool = True):
+        self.model = model
+        self.deterministic = deterministic
+        self.state = None
+        self.episode_start = np.array([True])
+
+    def reset(self):
+        """Reset LSTM state for a new episode."""
+        self.state = None
+        self.episode_start = np.array([True])
+
+    def __call__(self, obs, mask):
+        action, self.state = self.model.predict(
+            obs,
+            state=self.state,
+            episode_start=self.episode_start,
+            action_masks=mask,
+            deterministic=self.deterministic,
+        )
+        self.episode_start = np.array([False])
+        return int(action)
+
+
 def evaluate(env, agent_fn, n_episodes: int = 50) -> dict:
     """
     Evaluate an agent on the given env for n_episodes.
 
     Args:
         env: GoatEnv instance (opponent already configured)
-        agent_fn: Callable(obs, mask) -> action_idx
+        agent_fn: Callable(obs, mask) -> action_idx.
+            If it has a reset() method (e.g. RecurrentAgentFn),
+            it will be called at the start of each episode.
         n_episodes: Number of episodes to run
 
     Returns:
@@ -34,6 +71,8 @@ def evaluate(env, agent_fn, n_episodes: int = 50) -> dict:
 
     for _ in range(n_episodes):
         obs, _ = env.reset()
+        if hasattr(agent_fn, "reset"):
+            agent_fn.reset()
         done = False
         ep_reward = 0.0
         steps = 0
@@ -106,7 +145,8 @@ class EloTracker:
     Ratings are persisted to a JSON file.
     """
 
-    RANDOM_ID = "random"
+    HEURISTIC_ID = "heuristic"
+    RANDOM_ID = HEURISTIC_ID  # back-compat alias
     INITIAL_RATING = 1200.0
 
     def __init__(self, save_path: Optional[str | Path] = None):
