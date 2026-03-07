@@ -496,7 +496,7 @@ class GoatEnv(gym.Env):
 
         if mode == "model":
             assert model_path is not None
-            opp_model = MaskableRecurrentPPO.load(model_path)
+            opp_model = MaskableRecurrentPPO.load(model_path, device="cpu")
             self._opponent_fn = _RecurrentOpponentFn(opp_model)
             self._opponent_mode = "model"
             self._opponent_models = {}
@@ -504,11 +504,11 @@ class GoatEnv(gym.Env):
         elif mode == "mixed":
             # Load models once, wrap with stateful LSTM tracking
             recent = (
-                _RecurrentOpponentFn(MaskableRecurrentPPO.load(model_path))
+                _RecurrentOpponentFn(MaskableRecurrentPPO.load(model_path, device="cpu"))
                 if model_path else None
             )
             older = (
-                _RecurrentOpponentFn(MaskableRecurrentPPO.load(past_path))
+                _RecurrentOpponentFn(MaskableRecurrentPPO.load(past_path, device="cpu"))
                 if past_path else None
             )
             self._opponent_mode = "mixed"

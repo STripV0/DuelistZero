@@ -219,7 +219,7 @@ class SelfPlayCallback(BaseCallback):
         """
         from .maskable_recurrent_ppo import MaskableRecurrentPPO
 
-        opp_model = MaskableRecurrentPPO.load(str(model_path))
+        opp_model = MaskableRecurrentPPO.load(str(model_path), device="cpu")
         return RecurrentAgentFn(opp_model, deterministic=deterministic)
 
     def _sample_recent_opponent(
