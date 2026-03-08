@@ -12,6 +12,9 @@ Architecture:
   → segment-aware masked mean pooling: board_pool(64) | action_pool(64) | history_pool(64)
   → Linear(192, 256) + ReLU → embed_stream(256)
 
+  Side output: per-action transformer tokens (batch, 71, 64) stored in _last_action_tokens
+  for the cross-attention action head (padded positions zeroed).
+
   Merge: features(453) | embed_stream(256) = 709
   → Linear(709, 256) → ReLU → Linear(256, 256) → ReLU → output(256)
 """
@@ -79,6 +82,7 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
         self._history_shape = observation_space["action_history"].shape  # (16, 10)
         self._embed_dim = embed_dim
         self._d_model = d_model
+        self._last_action_tokens: torch.Tensor | None = None
 
         # Shared card embedding
         self.embedding = nn.Embedding(
@@ -135,6 +139,11 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
+
+    @property
+    def action_token_dim(self) -> int:
+        """Dimension of per-action transformer output tokens."""
+        return self._d_model
 
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
         features = observations["features"]
@@ -197,6 +206,10 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
         board_out = out[:, :n_board]
         action_out = out[:, n_board:n_board + n_action]
         history_out = out[:, n_board + n_action:]
+
+        # Store per-action transformer outputs for cross-attention action head
+        # Zero out padded positions so invalid actions get clean zero vectors
+        self._last_action_tokens = action_out * (~action_pad).unsqueeze(-1).float()
 
         board_pool = self._masked_mean(board_out, ~board_pad)
         action_pool = self._masked_mean(action_out, ~action_pad)

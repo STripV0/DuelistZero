@@ -53,6 +53,39 @@ from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
 
+# ─── Cross-attention action head ─────────────────────────────────────────────
+
+
+class CrossAttentionActionHead(nn.Module):
+    """Score each action by combining its transformer token with the LSTM state.
+
+    Instead of a positional Linear(latent_dim, n_actions), this head concatenates
+    per-action transformer outputs with the expanded LSTM latent and scores each
+    action independently, so logits are conditioned on action content + board
+    context + temporal state.
+    """
+
+    def __init__(self, latent_dim: int, action_token_dim: int, d_head: int = 64):
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.Linear(latent_dim + action_token_dim, d_head),
+            nn.ReLU(),
+            nn.Linear(d_head, 1),
+        )
+
+    def forward(self, latent_pi: th.Tensor, action_tokens: th.Tensor) -> th.Tensor:
+        """
+        Args:
+            latent_pi: (B, latent_dim) from LSTM + MLP
+            action_tokens: (B, n_actions, action_token_dim) from extractor
+        Returns:
+            logits: (B, n_actions)
+        """
+        expanded = latent_pi.unsqueeze(1).expand(-1, action_tokens.size(1), -1)
+        combined = th.cat([action_tokens, expanded], dim=-1)
+        return self.score(combined).squeeze(-1)
+
+
 # ─── Type aliases ────────────────────────────────────────────────────────────
 
 
@@ -341,8 +374,11 @@ class MaskableRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
 
         # Use maskable distribution instead of standard
         self.action_dist = make_masked_proba_distribution(self.action_space)
-        self.action_net = self.action_dist.proba_distribution_net(
+        # Cross-attention action head: score each action using its transformer
+        # token combined with the LSTM latent, instead of a positional Linear
+        self.action_net = CrossAttentionActionHead(
             latent_dim=self.mlp_extractor.latent_dim_pi,
+            action_token_dim=self.features_extractor.action_token_dim,
         )
         self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
 
@@ -372,8 +408,9 @@ class MaskableRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
     def _get_action_dist_from_latent(
         self, latent_pi: th.Tensor
     ) -> MaskableDistribution:
-        """Override to return maskable distribution."""
-        action_logits = self.action_net(latent_pi)
+        """Override to return maskable distribution with cross-attention action head."""
+        action_tokens = self.features_extractor._last_action_tokens
+        action_logits = self.action_net(latent_pi, action_tokens)
         return self.action_dist.proba_distribution(action_logits=action_logits)
 
     def forward(

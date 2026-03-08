@@ -202,5 +202,38 @@ def test_d_model_kwarg(obs_space, sample_obs):
         obs_space, hidden_dim=256, vocab_size=200, d_model=128
     )
     assert extractor._d_model == 128
+    assert extractor.action_token_dim == 128
     out = extractor(sample_obs)
     assert out.shape == (4, 256)
+
+
+def test_last_action_tokens_shape(obs_space, sample_obs):
+    """_last_action_tokens should have shape (B, 71, d_model) after forward."""
+    extractor = CardEmbeddingExtractor(obs_space, hidden_dim=256, vocab_size=200)
+    assert extractor._last_action_tokens is None
+    extractor(sample_obs)
+    tokens = extractor._last_action_tokens
+    assert tokens is not None
+    assert tokens.shape == (4, 71, 64)
+    assert not torch.isnan(tokens).any()
+
+
+def test_last_action_tokens_padded_zero(obs_space):
+    """Padded action positions should have zero-valued tokens."""
+    extractor = CardEmbeddingExtractor(obs_space, hidden_dim=256, vocab_size=200)
+    af = torch.zeros(2, 71, 12)
+    # Only populate slot 0 — all other slots are padded (card_id=0, continuous=0)
+    af[:, 0, 0] = 42.0
+    af[:, 0, 1] = 1.0
+    obs = {
+        "features": torch.randn(2, 453),
+        "card_ids": torch.randint(0, 100, (2, 50)).float(),
+        "action_features": af,
+        "action_history": torch.zeros(2, 16, 10),
+    }
+    extractor(obs)
+    tokens = extractor._last_action_tokens
+    # Slot 0 is populated — should be non-zero
+    assert tokens[:, 0].abs().sum() > 0
+    # Slots 1-70 are all padded — should be zero
+    assert torch.allclose(tokens[:, 1:], torch.zeros_like(tokens[:, 1:]))
