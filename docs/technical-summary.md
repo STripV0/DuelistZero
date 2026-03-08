@@ -42,6 +42,9 @@ CardEmbeddingExtractor (Three-Segment Transformer):
   → board_pool(64) | action_pool(64) | history_pool(64)
   → Linear(192, 256) + ReLU → embed_stream(256)
 
+  Side output: per-action transformer tokens (B, 71, 64) stored for action head
+               (padded positions zeroed)
+
   Merge:
     [features(453) | embed_stream(256)] = 709
     → Linear(709, 256) → ReLU
@@ -50,7 +53,12 @@ CardEmbeddingExtractor (Three-Segment Transformer):
                   ┌────────┴────────┐
              Policy Head       Value Head
           Linear(512, 256)   Linear(512, 256)
-          Linear(256, 71)    Linear(256, 1)
+                  │            Linear(256, 1)
+     CrossAttentionActionHead:
+       action_tokens(71, 64) from extractor
+       latent_pi(256) from LSTM+MLP
+       → cat([token, latent], dim=-1) per action → (71, 320)
+       → Linear(320, 64) → ReLU → Linear(64, 1) → squeeze → (71,)
 ```
 
 ### action_features — (71, 12) per action slot
@@ -533,6 +541,17 @@ Removed curriculum system. All decks available from start.
 **Fix:** Three-segment transformer with segment-aware masked mean pooling. Board (50), action (71), and history (16) tokens each get their own projection to d_model=64, share a TransformerEncoder (4 heads, 2 layers), then pool separately per segment. Pooled segments concatenated (192) → Linear(192, 256). ~49K params for pooling vs ~992K.
 
 **Result:** 86% win rate vs heuristic at 5M steps (old architecture: 72% plateau at 8.8M steps). Floor lifted from ~70% to ~78%.
+
+## Session 17 — Mar 9 (Cross-Attention Action Head)
+
+### Issue 75: Positional action head bottleneck (plateau at ~80%)
+**Problem:** Agent plateaued at ~80% vs heuristic. The action head was a simple `Linear(256, 71)` producing logits positionally — it had no awareness of individual action features. The transformer already cross-attended action tokens with board/history tokens, but per-action representations were **pooled away** into a single 64-dim vector before reaching the action head. The model had to memorize which logit position corresponds to which action type, rather than scoring each action based on its content.
+
+**Fix:** Cross-attention action head (`CrossAttentionActionHead`). Instead of pooling action tokens away, store per-action transformer outputs (B, 71, 64) as a side output from the extractor. The new action head concatenates each action's contextual token (64-dim) with the expanded LSTM latent (256-dim) and scores via `Linear(320, 64) → ReLU → Linear(64, 1)`. Each action logit is now conditioned on: (1) what the action is (card stats, action type, location), (2) board context (via transformer self-attention), (3) temporal game state (via LSTM hidden state).
+
+**Parameter count:** Old `Linear(256, 71)` = 18,176 params. New `CrossAttentionActionHead` = 20,608 params. Nearly identical.
+
+**Checkpoint compatibility:** Old checkpoints incompatible — action_net shape changed. Training restarted from scratch.
 
 ---
 
