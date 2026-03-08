@@ -11,9 +11,18 @@ Usage:
 """
 
 import argparse
+import os
 from pathlib import Path
 
-import torch.nn as nn
+# Prevent PyTorch thread bomb in SubprocVecEnv workers.
+# Each worker only needs 1 thread for small-model inference.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
+import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
+
+torch.set_num_threads(1)
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import SubprocVecEnv
 

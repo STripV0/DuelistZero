@@ -486,10 +486,14 @@ class GoatEnv(gym.Env):
             model_path: Path to frozen recent checkpoint (for "model"/"mixed").
             past_path: Path to frozen older checkpoint (for "mixed").
         """
+        # Explicitly free old opponent models before loading new ones
+        import gc
+        self._opponent_fn = None
+        self._opponent_models = {}
+        gc.collect()
+
         if mode == "heuristic":
-            self._opponent_fn = None
             self._opponent_mode = "heuristic"
-            self._opponent_models = {}
             return
 
         from ..training.maskable_recurrent_ppo import MaskableRecurrentPPO
@@ -499,7 +503,6 @@ class GoatEnv(gym.Env):
             opp_model = MaskableRecurrentPPO.load(model_path, device="cpu")
             self._opponent_fn = _RecurrentOpponentFn(opp_model)
             self._opponent_mode = "model"
-            self._opponent_models = {}
 
         elif mode == "mixed":
             # Load models once, wrap with stateful LSTM tracking
