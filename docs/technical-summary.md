@@ -170,10 +170,10 @@ Sparse terminal reward only — no intermediate shaping.
 
 **Phase 1 — Pre-training:** Agent trains vs heuristic opponent only (diverse decks from pool). Evaluates every 50k steps.
 
-**Phase 2 — Frozen-pool self-play** (activates when eval ≥ 70% vs heuristic):
-- 40% heuristic opponent (diverse deck from pool)
-- 30% frozen recent checkpoint (mirror deck)
-- 30% frozen older checkpoint (mirror deck)
+**Phase 2 — Frozen-pool self-play** (activates when eval ≥ 85% vs heuristic):
+- 60% heuristic opponent (diverse deck from pool)
+- 20% frozen recent checkpoint (mirror deck)
+- 20% frozen older checkpoint (mirror deck)
 - **Regression gate at 60%:** deactivates self-play if heuristic WR drops below
 - Per-episode opponent roll (consistent opponent within each game)
 
@@ -552,6 +552,13 @@ Removed curriculum system. All decks available from start.
 **Parameter count:** Old `Linear(256, 71)` = 18,176 params. New `CrossAttentionActionHead` = 20,608 params. Nearly identical.
 
 **Checkpoint compatibility:** Old checkpoints incompatible — action_net shape changed. Training restarted from scratch.
+
+### Issue 76: Self-play erosion — strategy cycling and meta-overfitting
+**Problem:** With cross-attention head, agent reached 76% vs heuristic by 1M steps, then self-play activated (70% gate). Over the next 4M steps, heuristic WR drifted from ~68% average down to ~60%. Classic MARL failure: agent shifted weights to exploit specific habits of its past checkpoints, catastrophically forgetting fundamental strategy needed to beat the aggressive heuristic. The 40/30/30 opponent mix (40% heuristic, 30% recent, 30% older) gave self-play gradients 60% weight — enough to overpower the heuristic anchor signal.
+
+**Fix:** Two changes:
+1. **Opponent mix 60/20/20**: 60% heuristic (diverse deck), 20% recent checkpoint (mirror), 20% older checkpoint (mirror). Agent spends the vast majority of training fighting the aggressive baseline.
+2. **Self-play gate raised to 85%**: Force the agent to hit its absolute ceiling against the heuristic before allowing self-play. Prevents premature activation where self-play erodes a still-developing foundation.
 
 ---
 
