@@ -35,7 +35,7 @@ class SelfPlayCallback(BaseCallback):
         save_dir: str = "checkpoints",
         eval_episodes: int = 200,
         no_self_play: bool = False,
-        self_play_threshold: float = 0.70,
+        self_play_threshold: float = 0.85,
         self_play_window: int = 1,
         regression_gate: float = 0.60,
         heuristic_limit: int = 5_000_000,
@@ -165,7 +165,7 @@ class SelfPlayCallback(BaseCallback):
                 past_path=str(older_path),
             )
             if self.verbose:
-                print(f"[SelfPlay] 40% heuristic (diverse) + 30% {recent_id} (mirror) + 30% {older_id} (mirror)")
+                print(f"[SelfPlay] 60% heuristic (diverse) + 20% {recent_id} (mirror) + 20% {older_id} (mirror)")
         else:
             # Heuristic-only with diverse decks
             self._broadcast_opponent(mode="heuristic")

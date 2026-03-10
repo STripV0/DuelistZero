@@ -245,11 +245,11 @@ class GoatEnv(gym.Env):
         if self._opponent_mode == "mixed":
             # Roll opponent type for this episode
             r = np.random.random()
-            if r < 0.40:
+            if r < 0.60:
                 # Heuristic with diverse deck from pool
                 self._opponent_fn = None
                 opp_deck = self._pick_diverse_deck()
-            elif r < 0.70:
+            elif r < 0.80:
                 # Recent frozen checkpoint with mirror deck
                 opp = self._opponent_models.get("recent")
                 if opp is not None:
@@ -478,8 +478,8 @@ class GoatEnv(gym.Env):
         Modes:
             "heuristic": Heuristic opponent with diverse decks from pool.
             "model": Single checkpoint opponent with mirror deck.
-            "mixed": Per-episode roll — 40% heuristic (diverse deck),
-                     30% recent frozen (mirror), 30% older frozen (mirror).
+            "mixed": Per-episode roll — 60% heuristic (diverse deck),
+                     20% recent frozen (mirror), 20% older frozen (mirror).
 
         Args:
             mode: One of "heuristic", "model", "mixed".

@@ -3,8 +3,8 @@ Self-play training pipeline using MaskableRecurrentPPO.
 
 Trains a YuGiOh GOAT format agent with LSTM memory via gated self-play:
 1. Phase 1: Train against heuristic (diverse decks) until threshold or step limit
-2. Phase 2: Per-episode mixed opponent — 40% heuristic (diverse deck),
-   30% recent frozen checkpoint (mirror), 30% older frozen (mirror)
+2. Phase 2: Per-episode mixed opponent — 60% heuristic (diverse deck),
+   20% recent frozen checkpoint (mirror), 20% older frozen (mirror)
 
 Usage:
     uv run python -m duelist_zero.training.self_play --timesteps 25000000 --n-envs 8
@@ -67,7 +67,7 @@ def train(
     n_epochs: int = 2,
     n_envs: int = 8,
     no_self_play: bool = False,
-    self_play_threshold: float = 0.70,
+    self_play_threshold: float = 0.85,
     regression_gate: float = 0.60,
     heuristic_limit: int = 5_000_000,
     pretrained_embeddings: str | None = None,
@@ -281,7 +281,7 @@ if __name__ == "__main__":
                         help="Number of parallel environments")
     parser.add_argument("--no-self-play", action="store_true",
                         help="Disable self-play (train vs heuristic only)")
-    parser.add_argument("--self-play-threshold", type=float, default=0.70,
+    parser.add_argument("--self-play-threshold", type=float, default=0.85,
                         help="Win rate vs heuristic to activate self-play")
     parser.add_argument("--regression-gate", type=float, default=0.60,
                         help="Deactivate self-play if heuristic win rate drops below this")
