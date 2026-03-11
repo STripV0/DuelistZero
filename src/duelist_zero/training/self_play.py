@@ -40,6 +40,7 @@ def mask_fn(env):
 def _make_env(
     deck_pool: list[str] | None = None,
     deck_weights: list[float] | None = None,
+    shaping_scale: float = 0.0,
 ) -> callable:
     """Return a factory function that creates a GoatEnv + ActionMasker.
 
@@ -50,6 +51,7 @@ def _make_env(
         env = GoatEnv(
             opponent_deck_pool=deck_pool,
             opponent_deck_weights=deck_weights,
+            shaping_scale=shaping_scale,
         )
         return ActionMasker(env, mask_fn)
     return _init
@@ -73,6 +75,7 @@ def train(
     pretrained_embeddings: str | None = None,
     lstm_hidden_size: int = 256,
     n_lstm_layers: int = 1,
+    shaping_scale: float = 0.5,
     verbose: int = 1,
 ):
     """
@@ -120,13 +123,15 @@ def train(
     # Create vectorized env
     if n_envs > 1:
         env = SubprocVecEnv([
-            _make_env(deck_pool=deck_pool, deck_weights=deck_weights)
+            _make_env(deck_pool=deck_pool, deck_weights=deck_weights,
+                      shaping_scale=shaping_scale)
             for _ in range(n_envs)
         ])
     else:
         env = GoatEnv(
             opponent_deck_pool=deck_pool,
             opponent_deck_weights=deck_weights,
+            shaping_scale=shaping_scale,
         )
         env = ActionMasker(env, mask_fn)
 
@@ -209,6 +214,7 @@ def train(
         print(f"  Checkpoint interval: {checkpoint_interval:,}")
         print(f"  Eval episodes:       {eval_episodes}")
         print(f"  Self-play threshold: {self_play_threshold:.0%}")
+        print(f"  Shaping scale:       {shaping_scale}")
         print(f"  LSTM hidden size:    {lstm_hidden_size}")
         print(f"  LSTM layers:         {n_lstm_layers}")
         print(f"  n_steps (per env):   {n_steps}")
@@ -293,6 +299,8 @@ if __name__ == "__main__":
                         help="LSTM hidden state dimension")
     parser.add_argument("--n-lstm-layers", type=int, default=1,
                         help="Number of LSTM layers")
+    parser.add_argument("--shaping-scale", type=float, default=0.5,
+                        help="PBRS reward shaping scale (0 = disabled)")
     args = parser.parse_args()
 
     train(
@@ -313,4 +321,5 @@ if __name__ == "__main__":
         pretrained_embeddings=args.pretrained_embeddings,
         lstm_hidden_size=args.lstm_hidden_size,
         n_lstm_layers=args.n_lstm_layers,
+        shaping_scale=args.shaping_scale,
     )

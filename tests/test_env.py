@@ -147,3 +147,29 @@ class TestStressTest:
             assert avg_steps < 450, f"Average steps too high ({avg_steps:.0f}), likely truncating"
         finally:
             env.close()
+
+    def test_100_duels_with_pbrs(self):
+        """Run 100 complete duels with PBRS shaping enabled."""
+        env = GoatEnv(shaping_scale=0.5)
+        try:
+            results = []
+            for i in range(100):
+                env.reset(seed=i)
+                done = False
+                steps = 0
+                reward = 0.0
+                while not done and steps < 300:
+                    mask = env.valid_action_mask()
+                    action = int(np.random.choice(np.where(mask)[0]))
+                    _, reward, terminated, truncated, _ = env.step(action)
+                    done = terminated or truncated
+                    steps += 1
+                results.append((done, reward, steps))
+
+            assert all(r[0] for r in results), "Some duels did not terminate"
+            # With PBRS, terminal rewards can include shaping component
+            assert all(-2.0 <= r[1] <= 2.0 for r in results), "Terminal rewards out of range"
+            avg_steps = sum(r[2] for r in results) / len(results)
+            assert avg_steps < 450, f"Average steps too high ({avg_steps:.0f}), likely truncating"
+        finally:
+            env.close()

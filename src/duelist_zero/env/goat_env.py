@@ -60,7 +60,7 @@ from .observation import (
 )
 from .card_index import CardIndex
 from .action_space import ActionSpace, ACTION_DIM, _respond_select_place
-from .reward import compute_reward
+from .reward import compute_reward, compute_potential
 from .heuristic import heuristic_action
 
 
@@ -132,6 +132,7 @@ class GoatEnv(gym.Env):
         opponent_fn: Optional[Callable[[np.ndarray, np.ndarray], int]] = None,
         seed: Optional[int] = None,
         render_mode: Optional[str] = None,
+        shaping_scale: float = 0.0,
     ):
         super().__init__()
 
@@ -216,6 +217,16 @@ class GoatEnv(gym.Env):
         self._last_idle_action: Optional[int] = None
         self._last_idle_msg: Optional[MsgSelectIdleCmd] = None
 
+        # PBRS reward shaping
+        self._shaping_scale = shaping_scale
+        self._gamma = 0.99
+        self._prev_potential = 0.0
+
+        # Sequential multi-card selection state
+        self._multi_select_indices: list[int] = []
+        self._multi_select_needed: int = 0
+        self._multi_select_msg: Optional[ParsedMessage] = None
+
         # Seeding
         if seed is not None:
             random.seed(seed)
@@ -298,6 +309,11 @@ class GoatEnv(gym.Env):
         self._last_idle_action = None
         self._last_idle_msg = None
 
+        # Reset multi-select state
+        self._multi_select_indices = []
+        self._multi_select_needed = 0
+        self._multi_select_msg = None
+
         # Process until agent's first decision.
         # If the game ends before the agent gets a turn (e.g. opponent
         # wins immediately), re-create the duel to avoid a stuck state.
@@ -313,6 +329,14 @@ class GoatEnv(gym.Env):
             self._duel._deck2 = deck2
             self._duel.start()
 
+        # Initialize PBRS potential
+        if self._shaping_scale > 0 and self._duel is not None:
+            self._prev_potential = compute_potential(
+                self._duel.state, self._agent_player
+            )
+        else:
+            self._prev_potential = 0.0
+
         obs = self._get_obs()
         info = self._get_info()
         return obs, info
@@ -322,7 +346,20 @@ class GoatEnv(gym.Env):
 
         self._step_count += 1
 
-        # If there's a pending decision, send the agent's action
+        # ---- Multi-select continuation ----
+        if self._multi_select_msg is not None:
+            return self._step_multi_select(action)
+
+        # ---- Multi-select initiation ----
+        if (
+            self._pending_msg is not None
+            and isinstance(self._pending_msg, (MsgSelectCard, MsgSelectTribute))
+            and self._pending_msg.min_count > 1
+            and action != 50  # not cancel
+        ):
+            return self._begin_multi_select(action)
+
+        # ---- Normal step ----
         if self._pending_msg is not None:
             # Track idle cmd context for tribute-cancel detection
             if isinstance(self._pending_msg, MsgSelectIdleCmd):
@@ -347,11 +384,29 @@ class GoatEnv(gym.Env):
         # Advance until next agent decision or game end
         self._pending_msg = self._advance()
 
+        return self._finish_step()
+
+    def _finish_step(self) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
+        """Compute reward (with PBRS), obs, and done flags after engine advance."""
         state = self._duel.state
         terminated = state.is_finished
         truncated = self._step_count >= _MAX_STEPS and not terminated
 
-        reward = compute_reward(state, self._agent_player)
+        # Compute PBRS
+        if self._shaping_scale > 0 and not terminated and not truncated:
+            curr_potential = compute_potential(state, self._agent_player)
+        else:
+            curr_potential = 0.0  # terminal/truncated: absorbing state
+
+        reward, potential = compute_reward(
+            state,
+            self._agent_player,
+            prev_potential=self._prev_potential,
+            curr_potential=curr_potential,
+            gamma=self._gamma,
+            shaping_scale=self._shaping_scale,
+        )
+        self._prev_potential = potential
 
         # Truncation penalty: stalling is as bad as losing
         if truncated:
@@ -361,8 +416,102 @@ class GoatEnv(gym.Env):
         info = self._get_info()
         return obs, reward, terminated, truncated, info
 
+    # ============================================================
+    # Sequential multi-card selection
+    # ============================================================
+    def _begin_multi_select(self, action: int) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
+        """Start sequential multi-card selection. Records the first pick."""
+        msg = self._pending_msg
+        card_idx = action - 51  # _SELECT_CARD_START
+        card_idx = max(0, min(card_idx, len(msg.cards) - 1))
+
+        self._multi_select_indices = [card_idx]
+        self._multi_select_needed = msg.min_count
+        self._multi_select_msg = msg
+        # Keep self._pending_msg pointing to original msg so _get_obs() works
+
+        # Check truncation
+        if self._step_count >= _MAX_STEPS:
+            self._multi_select_indices = []
+            self._multi_select_needed = 0
+            self._multi_select_msg = None
+            return self._get_obs(), -1.0, False, True, self._get_info()
+
+        return self._get_obs(), 0.0, False, False, self._get_info()
+
+    def _step_multi_select(self, action: int) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
+        """Continue sequential multi-card selection."""
+        msg = self._multi_select_msg
+
+        # Cancel (action 50, if cancelable)
+        if action == 50 and msg.cancelable:
+            self._multi_select_indices = []
+            self._multi_select_needed = 0
+            self._multi_select_msg = None
+            self._cancelled_tribute_code = None
+
+            # Handle tribute cancel detection
+            if isinstance(msg, MsgSelectTribute):
+                if self._last_idle_msg is not None and self._last_idle_action is not None:
+                    code = self._resolve_idle_card_code(
+                        self._last_idle_action, self._last_idle_msg
+                    )
+                    if code is not None:
+                        self._cancelled_tribute_code = code
+
+            self._duel.respond_int(-1)
+            self._pending_msg = self._advance()
+            return self._finish_step()
+
+        # Normal pick
+        card_idx = action - 51  # _SELECT_CARD_START
+        card_idx = max(0, min(card_idx, len(msg.cards) - 1))
+
+        # Prevent duplicate selection (shouldn't happen with masking)
+        if card_idx in self._multi_select_indices:
+            # Pick first available unselected
+            for i in range(len(msg.cards)):
+                if i not in self._multi_select_indices:
+                    card_idx = i
+                    break
+
+        self._multi_select_indices.append(card_idx)
+        self._step_count += 1
+
+        # All cards collected?
+        if len(self._multi_select_indices) >= self._multi_select_needed:
+            indices = list(self._multi_select_indices)
+            self._multi_select_indices = []
+            self._multi_select_needed = 0
+            self._multi_select_msg = None
+            self._cancelled_tribute_code = None
+
+            self._duel.respond_card_selection(indices)
+            self._pending_msg = self._advance()
+            return self._finish_step()
+
+        # Still need more picks — check truncation
+        if self._step_count >= _MAX_STEPS:
+            self._multi_select_indices = []
+            self._multi_select_needed = 0
+            self._multi_select_msg = None
+            return self._get_obs(), -1.0, False, True, self._get_info()
+
+        return self._get_obs(), 0.0, False, False, self._get_info()
+
     def valid_action_mask(self) -> np.ndarray:
         """Return boolean mask of valid actions for the current pending message."""
+        # Multi-select: only show unselected cards (and cancel if allowed)
+        if self._multi_select_msg is not None:
+            msg = self._multi_select_msg
+            mask = np.zeros(ACTION_DIM, dtype=bool)
+            for i in range(min(len(msg.cards), 10)):
+                if i not in self._multi_select_indices:
+                    mask[51 + i] = True
+            if msg.cancelable:
+                mask[50] = True
+            return mask
+
         if self._pending_msg is None:
             # No pending decision — all actions valid (shouldn't happen in practice)
             return np.ones(ACTION_DIM, dtype=bool)
