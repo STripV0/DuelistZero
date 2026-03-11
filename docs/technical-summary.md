@@ -148,13 +148,25 @@ See architecture section above for full column layouts.
 | 47 | Go to Main Phase 2 |
 | 48 | Go to End Phase (battle) |
 | 49-50 | Yes / No |
-| 51-60 | Select card 0-9 |
+| 51-60 | Select card 0-9 (sequential multi-select for 2+ cards) |
 | 61-62 | Position ATK / DEF |
 | 63-70 | Select option 0-7 |
 
+### Sequential Multi-Card Selection
+
+When the engine asks for 2+ cards (tributes, Graceful Charity discards, etc.), the agent picks one card per step instead of auto-filling from a single index. A state machine in `GoatEnv` tracks:
+
+- `_multi_select_indices`: cards picked so far
+- `_multi_select_needed`: total cards required (from `msg.min_count`)
+- `_multi_select_msg`: original SELECT_CARD/SELECT_TRIBUTE message
+
+The action mask excludes already-selected cards. Cancel (action 50) is available mid-selection if the message is cancelable. Intermediate picks return reward=0; the full reward is computed when all picks are collected and sent to the engine. Opponents still use the old auto-fill path.
+
 ## Reward Function
 
-Sparse terminal reward only — no intermediate shaping.
+Terminal reward scaled by turn count, plus potential-based reward shaping (PBRS).
+
+### Terminal Reward
 
 | Outcome | Reward |
 |---|---|
@@ -163,8 +175,29 @@ Sparse terminal reward only — no intermediate shaping.
 | Win (turn ≥ 20) | 0.3 |
 | Loss | -1.0 |
 | Draw | 0.0 |
-| Non-terminal | 0.0 |
 | Truncation (200 steps) | -1.0 |
+
+### Potential-Based Reward Shaping (PBRS)
+
+PBRS (Ng et al. 1999) adds intermediate reward signal without changing the optimal policy. Each step receives a shaping bonus:
+
+```
+F(s, s') = shaping_scale × (γ · Φ(s') − Φ(s))
+```
+
+The potential function `Φ(s)` uses only public game state:
+
+```python
+Φ(s) = 0.4 × lp_advantage + 0.35 × board_advantage + 0.25 × card_advantage
+```
+
+- `lp_advantage`: `clamp((my_lp - opp_lp) / 8000, -1, 1)`
+- `board_advantage`: `(my_monsters - opp_monsters) / 5`
+- `card_advantage`: `clamp((my_total_cards - opp_total_cards) / 10, -1, 1)`
+
+Terminal states use `Φ = 0` (absorbing state convention). With `shaping_scale=0.5`, shaped rewards are ~[-0.02, 0.02] per step vs terminal [0.3, 1.0] / -1.0.
+
+Configure via `--shaping-scale` (default 0.5, set to 0 to disable).
 
 ## Training Strategy
 
@@ -559,6 +592,17 @@ Removed curriculum system. All decks available from start.
 **Fix:** Two changes:
 1. **Opponent mix 60/20/20**: 60% heuristic (diverse deck), 20% recent checkpoint (mirror), 20% older checkpoint (mirror). Agent spends the vast majority of training fighting the aggressive baseline.
 2. **Self-play gate raised to 85%**: Force the agent to hit its absolute ceiling against the heuristic before allowing self-play. Prevents premature activation where self-play erodes a still-developing foundation.
+
+## Session 18 — Mar 11 (PBRS Reward Shaping + Sequential Multi-Card Selection)
+
+### Issue 77: Sparse terminal reward — zero gradient for intermediate decisions
+**Problem:** Agent plateaued at ~70-80% vs heuristic. With sparse terminal-only reward, the agent received zero gradient signal for 50-300 intermediate steps per game. Could not learn trap timing, tribute decisions, or board control — only whether the final outcome was win/loss.
+**Fix:** Added potential-based reward shaping (PBRS, Ng et al. 1999). Computes `Φ(s) = 0.4×lp_adv + 0.35×board_adv + 0.25×card_adv` from public game state. Each step receives `shaping_scale × (γ·Φ(s') − Φ(s))` as intermediate reward. Mathematically guaranteed not to change the optimal policy. Configurable via `--shaping-scale` (default 0.5).
+**Result:** Agent peaked at 85% vs heuristic at 2.9M steps (previous best: 76%).
+
+### Issue 78: Broken multi-card selection — auto-fill from single index
+**Problem:** When the engine asked for 2+ cards (tributes, Graceful Charity discards), `ActionSpace.decode()` auto-filled sequentially from the chosen index: `indices = [(card_idx + i) % len(cards)]`. The agent could never choose optimal card combinations — it always got consecutive cards starting from its pick.
+**Fix:** Sequential multi-card selection state machine in `GoatEnv`. When `min_count > 1`, the agent picks one card per step. The action mask excludes already-selected cards. All picks are collected, then sent to the engine as a batch. Opponents still use the old auto-fill path.
 
 ---
 
