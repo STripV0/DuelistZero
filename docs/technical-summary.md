@@ -8,12 +8,13 @@
 |---|---|
 | Learning rate | 3e-5 |
 | n_steps (rollout) | 512 |
-| Batch size | 128 |
-| n_epochs | 2 |
+| Batch size | 256 |
+| n_epochs | 4 |
 | Gamma | 0.99 |
-| Entropy coef | 0.10 |
+| Entropy coef | 0.05 |
+| VF coef | 0.8 |
 | Clip range | 0.2 |
-| Parallel envs | 8 (SubprocVecEnv) |
+| Parallel envs | 16 (SubprocVecEnv) |
 | LSTM hidden size | 256 |
 | LSTM layers | 1 |
 
@@ -21,19 +22,20 @@
 
 ```
 Observation Dict
-  ├── "features"         (453,)    float32 — game state features
+  ├── "features"         (462,)    float32 — game state features
   ├── "card_ids"         (50,)     float32 — card identity indices
-  ├── "action_features"  (71, 12)  float32 — rich per-action features
-  └── "action_history"   (16, 10)  float32 — structured action history
+  ├── "action_features"  (71, 29)  float32 — rich per-action features with ownership,
+  │                                         effect categories, and ATK matchup
+  └── "action_history"   (16, 13)  float32 — structured action history with outcomes
 
 CardEmbeddingExtractor (Three-Segment Transformer):
 
-  nn.Embedding(vocab_size=~14k, embed_dim=32, padding_idx=0)
+  nn.Embedding(vocab_size=~14k, embed_dim=64, padding_idx=0)
     └── optionally initialized from pretrained embeddings (.npy)
 
-  Board tokens:   card_ids(50) → embed(32) → Linear(32, 64)       → (50, 64)
-  Action tokens:  action_features(71,12) → embed col0 + cols1-11  → Linear(43, 64) → (71, 64)
-  History tokens: action_history(16,10)  → embed col0 + cols1-9   → Linear(41, 64) → (16, 64)
+  Board tokens:   card_ids(50) → embed(64) → Identity (64=d_model) → (50, 64)
+  Action tokens:  action_features(71,29) → embed col0(64) + cols1-28 → Linear(92, 64)  → (71, 64)
+  History tokens: action_history(16,13)  → embed col0(64) + cols1-12 → Linear(76, 64)  → (16, 64)
 
   + segment_embedding(3, 64): board=0, action=1, history=2
   → concat: (137, 64)
@@ -42,43 +44,62 @@ CardEmbeddingExtractor (Three-Segment Transformer):
   → board_pool(64) | action_pool(64) | history_pool(64)
   → Linear(192, 256) + ReLU → embed_stream(256)
 
-  Side output: per-action transformer tokens (B, 71, 64) stored for action head
-               (padded positions zeroed)
+  Side outputs (padded positions zeroed):
+    _last_action_tokens: (B, 71, 64) for cross-attention action head
+    _last_board_tokens:  (B, 50, 64) for cross-attention value head
 
   Merge:
-    [features(453) | embed_stream(256)] = 709
-    → Linear(709, 256) → ReLU
+    [features(462) | embed_stream(256)] = 718
+    → Linear(718, 256) → ReLU
     → Linear(256, 256) → ReLU → LSTM(256) →
                            │
                   ┌────────┴────────┐
              Policy Head       Value Head
           Linear(512, 256)   Linear(512, 256)
-                  │            Linear(256, 1)
-     CrossAttentionActionHead:
-       action_tokens(71, 64) from extractor
-       latent_pi(256) from LSTM+MLP
-       → cat([token, latent], dim=-1) per action → (71, 320)
-       → Linear(320, 64) → ReLU → Linear(64, 1) → squeeze → (71,)
+                  │                  │
+     CrossAttentionActionHead   Linear(256, 1):
+       action_tokens(71, 64)      latent_vf(256) from LSTM+MLP
+       latent_pi(256)             → scalar V(s)
+       → cat per action (320)
+       → Linear(320,64)→ReLU
+       → Linear(64,1)→(71,)
 ```
 
-### action_features — (71, 12) per action slot
+### action_features — (71, 29) per action slot
 
-| Col | Feature | Range |
-|---|---|---|
-| 0 | card_id (embedding index) | [0, vocab) |
-| 1 | is_summon | {0,1} |
-| 2 | is_spsummon | {0,1} |
-| 3 | is_set | {0,1} |
-| 4 | is_activate | {0,1} |
-| 5 | is_attack | {0,1} |
-| 6 | is_reposition | {0,1} |
-| 7 | is_phase/pass/other | {0,1} |
-| 8 | ATK / 5000 | [0,1] |
-| 9 | DEF / 5000 | [0,1] |
-| 10 | level / 12 | [0,1] |
-| 11 | location | 0.0=none, 0.2=hand, 0.4=mzone, 0.6=szone, 0.8=grave, 1.0=removed |
+| Col | Feature | Range | Phase |
+|---|---|---|---|
+| 0 | card_id (embedding index) | [0, vocab) | original |
+| 1 | is_summon | {0,1} | original |
+| 2 | is_spsummon | {0,1} | original |
+| 3 | is_set | {0,1} | original |
+| 4 | is_activate | {0,1} | original |
+| 5 | is_attack | {0,1} | original |
+| 6 | is_reposition | {0,1} | original |
+| 7 | is_phase/pass/other | {0,1} | original |
+| 8 | ATK / 5000 | [0,1] | original |
+| 9 | DEF / 5000 | [0,1] | original |
+| 10 | level / 12 | [0,1] | original |
+| 11 | location | 0.0=none, 0.2=hand, 0.4=mzone, 0.6=szone, 0.8=grave, 1.0=removed | original |
+| 12 | target_is_mine | {0,1} — SELECT_CARD/TRIBUTE/CHAIN only | C1 |
+| 13 | target_is_opp | {0,1} — SELECT_CARD/TRIBUTE/CHAIN only | C1 |
+| 14 | destroys_monster | {0,1} | C2 |
+| 15 | destroys_spelltrap | {0,1} | C2 |
+| 16 | negates | {0,1} | C2 |
+| 17 | draws_cards | {0,1} | C2 |
+| 18 | searches_deck | {0,1} | C2 |
+| 19 | flips_facedown | {0,1} | C2 |
+| 20 | burns_lp | {0,1} | C2 |
+| 21 | bounces_to_hand | {0,1} | C2 |
+| 22 | special_summons | {0,1} | C2 |
+| 23 | gains_atk | {0,1} | C2 |
+| 24 | changes_position | {0,1} | C2 |
+| 25 | protects | {0,1} | C2 |
+| 26 | target_atk_norm (strongest opp monster ATK/5000) | [0,1] — attack actions only | C3 |
+| 27 | atk_advantage (my ATK - max opp ATK)/5000 | [-1,1] — attack actions only | C3 |
+| 28 | opp_has_facedown | {0,1} — attack actions only | C3 |
 
-### action_history — (16, 10) last 16 public actions
+### action_history — (16, 13) last 16 public actions
 
 | Col | Feature | Range |
 |---|---|---|
@@ -92,22 +113,25 @@ CardEmbeddingExtractor (Three-Segment Transformer):
 | 7 | ATK / 5000 | [0,1] |
 | 8 | DEF / 5000 | [0,1] |
 | 9 | turns_ago / 40 | [0,1] |
+| 10 | damage / 8000 (battle damage dealt) | [0,1] |
+| 11 | cards_destroyed / 5 (by this action) | [0,1] |
+| 12 | was_negated | {0,1} |
 
 ### LLM-Pretrained Card Embeddings
 
 Card embeddings can be pre-initialized from card text using sentence-transformers:
 
 1. Card name + effect text encoded with `all-MiniLM-L6-v2` (384-dim)
-2. PCA reduction to 32 dims (matching `embed_dim`)
-3. Saved as `data/card_embeddings.npy` (14,337 × 32, index 0 = zero padding)
+2. PCA reduction to 64 dims (matching `embed_dim`, 64.4% variance explained)
+3. Saved as `data/card_embeddings.npy` (14,337 × 64, index 0 = zero padding)
 4. Loaded at model init, then fine-tuned during training
 
 Generate: `uv run --group embeddings python scripts/generate_card_embeddings.py`
 Train with: `--pretrained-embeddings data/card_embeddings.npy`
 
-## Observation Space (453 features + structured keys)
+## Observation Space (462 features + structured keys)
 
-### features (453,)
+### features (462,)
 
 | Range | Description |
 |---|---|
@@ -122,12 +146,13 @@ Train with: `--pretrained-embeddings data/card_embeddings.npy`
 | [233-282] | Opp spell/trap zone: 5 slots × 10 features (face-down hidden) |
 | [283-432] | My hand: 10 slots × 15 features |
 | [433-452] | Deck identity one-hot (20) |
+| [453-461] | Opponent inference: extra draws, facedown count, 5×S/T age, GY monsters, banished |
 
 ### card_ids (50,)
 
 My field (10) + opp field face-up (10) + my hand (10) + my GY top 10 + opp GY top 10.
 
-### action_features (71, 12) and action_history (16, 10)
+### action_features (71, 29) and action_history (16, 13)
 
 See architecture section above for full column layouts.
 
@@ -185,15 +210,17 @@ PBRS (Ng et al. 1999) adds intermediate reward signal without changing the optim
 F(s, s') = shaping_scale × (γ · Φ(s') − Φ(s))
 ```
 
-The potential function `Φ(s)` uses only public game state:
+The potential function `Φ(s)` uses a hybrid of ATK-weighted board power, card count, and LP:
 
 ```python
-Φ(s) = 0.4 × lp_advantage + 0.35 × board_advantage + 0.25 × card_advantage
+Φ(s) = 0.40 × atk_advantage + 0.25 × card_advantage + 0.35 × lp_advantage
 ```
 
+- `atk_advantage`: `clamp(sum(my_faceup_atk/5000) - sum(opp_faceup_atk/5000), -1, 1)` — ATK-weighted board power (requires card DB). Falls back to count-based `(my_monsters - opp_monsters) / 5` when DB unavailable.
+- `card_advantage`: `clamp((my_total_cards - opp_total_cards) / 10, -1, 1)` — total cards (hand + field)
 - `lp_advantage`: `clamp((my_lp - opp_lp) / 8000, -1, 1)`
-- `board_advantage`: `(my_monsters - opp_monsters) / 5`
-- `card_advantage`: `clamp((my_total_cards - opp_total_cards) / 10, -1, 1)`
+
+The ATK-weighted approach means tributing 2 weak monsters (1000 ATK each) for 1 strong monster (2800 ATK) registers as a net improvement, unlike the old count-based board_adv which would see it as -1 card. Card advantage is kept so Pot of Greed (+2 cards) and setting traps still register as positive potential.
 
 Terminal states use `Φ = 0` (absorbing state convention). With `shaping_scale=0.5`, shaped rewards are ~[-0.02, 0.02] per step vs terminal [0.3, 1.0] / -1.0.
 
@@ -604,6 +631,151 @@ Removed curriculum system. All decks available from start.
 **Problem:** When the engine asked for 2+ cards (tributes, Graceful Charity discards), `ActionSpace.decode()` auto-filled sequentially from the chosen index: `indices = [(card_idx + i) % len(cards)]`. The agent could never choose optimal card combinations — it always got consecutive cards starting from its pick.
 **Fix:** Sequential multi-card selection state machine in `GoatEnv`. When `min_count > 1`, the agent picks one card per step. The action mask excludes already-selected cards. All picks are collected, then sent to the engine as a batch. Opponents still use the old auto-fill path.
 
+## Session 19 — Mar 12 (8 Architecture Improvements)
+
+Agent peaked at 85% vs heuristic with PBRS but oscillated in the 60-72% range post self-play. Identified 8 architectural weaknesses, split into Phase A (backward-compatible) and Phase B (checkpoint-breaking, retrain from scratch).
+
+### Improvement A1: Engine State Hash Check
+
+**Problem:** Issues #10, #40, #42 were silent struct bugs that corrupted training for 100k+ steps. No validation existed to catch state desync between Python GameState and the C++ engine.
+
+**Fix:** Added `Duel.verify_state()` method that queries the engine via `query_card()` for each MZONE/SZONE slot and compares card codes against Python GameState. Added debug hooks in `GoatEnv.reset()` and `GoatEnv.step()` via `if __debug__:` — zero cost in production (`python -O`), immediate feedback during development. New `test_state_sync.py` runs 10 heuristic games with verification after every step.
+
+### Improvement A2: Action Space Overflow Logging
+
+**Problem:** When >5 summonable cards (or >10 activatable) are available, the excess is silently dropped by list slicing. The agent never knows options were lost.
+
+**Fix:** Added `logging.getLogger` warnings on first overflow per action type (summon, spsummon, set_monster, set_st, activate, reposition) in `ActionSpace.get_mask()`. Logs count and how many dropped. Already caught overflows in the first training run: `set_st` and `summon` with 6 options capped at 5.
+
+### Improvement A3: PBRS Hybrid Potential Function
+
+**Problem:** The old potential function used count-based `board_adv = (my_monsters - opp_monsters) / 5`. Tributing 2 weak monsters for 1 strong one registered as -1 card advantage. But fully replacing card count with ATK sum would create a blind spot for Spells/Traps (Pot of Greed = +1 card but 0 ATK difference).
+
+**Fix:** Hybrid potential: `Φ(s) = 0.40 × atk_adv + 0.25 × card_adv + 0.35 × lp_adv`. When card DB is available, `atk_adv` sums ATK/5000 for face-up monsters per side (clamped to [-1,1]). Falls back to count-based when DB is None. `card_adv` kept so drawing spells and setting traps still register. Passed `db=self._card_db` to both `compute_potential()` call sites in GoatEnv.
+
+### Improvement A4: Face-Down Card Age Tracking
+
+**Problem:** Prerequisite for B2. No way to represent how long a face-down card has been set — a key signal for experienced players (a card set for 5 turns is more likely a trap than one set this turn).
+
+**Fix:** Added `set_turn: int = 0` to `ZoneCard`. In `_handle_move()`, destination cards get `set_turn=state.current_turn`. Used by B2's opponent inference features.
+
+### Improvement B1: Richer Action History (16×10 → 16×13)
+
+**Problem:** History had no outcomes — "opponent activated Mirror Force" but not "...destroyed 3 monsters." The agent couldn't learn that certain activations are dangerous.
+
+**Fix:** Added `_pending_attack_record` to GameState for damage attribution. On MsgDamage following an attack, annotates `damage` on that specific record (prevents mis-attributing burn damage). On MsgMove (field→grave), increments `destroyed` on the last activate record. On MsgChainNegated, marks `was_negated`. Three new history columns: `damage/8000` (col 10), `cards_destroyed/5` (col 11), `was_negated` (col 12). Also tracks `extra_draws` per player for B2.
+
+### Improvement B2: Opponent Hand Inference + Face-Down Age (453 → 462)
+
+**Problem:** Agent had zero representation of what opponent might hold, how old set cards are, or graveyard composition.
+
+**Fix:** 9 new features appended to observation:
+- `opp_extra_draws / 5.0` — draws beyond normal draw phase (Pot of Greed indicator)
+- `opp_facedown_count / 5.0` — total face-down cards
+- Per opponent S/T slot × 5: `turns_since_set / 10.0` (uses `ZoneCard.set_turn` from A4)
+- `opp_graveyard_monster_count / 10.0` — GY monster depth (Chaos fuel indicator)
+- `opp_banished_count / 10.0` — Chaos plays used
+
+OBSERVATION_DIM: 453 → 462. Merge MLP adjusts automatically.
+
+### Improvement B3: Board Token Preservation (cross-attention value head)
+
+**Problem:** 50 board tokens were mean-pooled to a single 64-dim vector. The critic couldn't assess specific board positions (e.g. "3000 ATK threat in Zone 2 is lethal").
+
+**Fix:** Extractor now stores `_last_board_tokens` (50×64, padded positions zeroed) alongside `_last_action_tokens`. New `BoardAttentionValueHead` replaces `Linear(256, 1)`: projects latent_vf (256) to a query (64), attends over 50 board tokens (single-head cross-attention with padding mask), concatenates attended context with latent_vf, projects to scalar V(s). The critic path now has per-card board awareness while the actor path remains unchanged.
+
+### Improvement B4: Increase Card Embedding Dimension (32 → 64)
+
+**Problem:** 14k cards in 32 dimensions is tight for distinguishing strategically different cards. PCA at 32d captured only ~47% of variance from the sentence-transformer encodings.
+
+**Fix:** Doubled `embed_dim` to 64. Since 64 matches `d_model`, `board_project` becomes `nn.Identity()` (saves parameters and computation — no projection needed). PCA at 64d captures 64.4% variance. Modern GPU tensor cores process 64-wide blocks optimally, so no speed penalty vs 48d. Regenerated `data/card_embeddings.npy` at (14337, 64).
+
+**Checkpoint compatibility:** All Phase B changes break checkpoints. Training restarted from scratch with the full v3 architecture.
+
+## Session 20 — Mar 12-15 (B3 Ablation + Hyperparameter Tuning)
+
+### Issue 79: BoardAttentionValueHead causing critic failure (explained variance declining)
+
+**Problem:** With all 8 Phase B improvements live, training plateaued at 65% vs heuristic for 8M+ steps. Explained variance *declined* from 0.44 → 0.34 over training — the critic was getting worse, not better. The old architecture reached 85% with the same hyperparameters.
+
+**Diagnosis:** B3 (cross-attention value head) was the prime suspect. Adding attention to the critic while keeping the actor unchanged made the critic much harder to optimize. The hyperparameters (batch_size=128, n_epochs=2) were tuned for the simpler Linear(256,1) critic, not an attention-based one.
+
+**Fix:** Added `--no-board-attention` toggle to disable B3 and fall back to `Linear(256, 1)` value head. Cannot resume from old checkpoint (weight shape mismatch) — restarted training from scratch.
+
+### Issue 80: Hyperparameters sub-optimal for larger architecture
+
+**Problem:** Phase B's larger model (64d embeddings, richer history, attention heads) needed different hyperparameters than the original architecture. Low batch size (128) caused high gradient noise; few epochs (2) gave insufficient critic updates; high entropy coef (0.10) prevented the agent from committing to learned strategies.
+
+**Fix:** Tuned hyperparameters:
+- `batch_size`: 128 → 256 (stabler gradients)
+- `n_epochs`: 2 → 4 (more critic updates per rollout)
+- `ent_coef`: 0.10 → 0.05 (less forced exploration)
+- `vf_coef`: 0.5 → 0.8 (stronger critic gradient signal)
+- Added `--ent-coef`, `--vf-coef` CLI args and injection on `--resume`
+
+**Result:** With B3 disabled + tuned hyperparams, agent hit 88% by 6M steps, 90% peak by 15M steps. Explained variance climbed to 0.51 (vs 0.34 with B3 on). Training stable in the 82-90% range.
+
+### Issue 81: SelfPlayCallback loses checkpoint pool on resume
+
+**Problem:** When resuming from a checkpoint, the `SelfPlayCallback` started with an empty pool and `_self_play_active=False`. Self-play had to re-activate from scratch, losing all progress.
+
+**Fix:** Added checkpoint discovery in `_init_callback()`: scans `save_dir` for existing `ckpt_*.zip` files, populates the pool, fast-forwards `_next_checkpoint_step`, and re-activates self-play if ≥2 checkpoints exist.
+
+### Issue 82: Parallel envs speedup — 8 → 16 envs
+
+**Problem:** Training at 80-100 FPS with 8 envs. GPU at 26% utilization, CPU at 30%. Neither saturated.
+
+**Fix:** Bumped `--n-envs` to 16. FPS increased to 108-157 (60-90% faster). CPU now at ~80%, GPU still has headroom.
+
+## Session 21 — Mar 16-20 (Human Testing + Phase C: Structured Card Semantics)
+
+### Issue 83: Agent plays randomly against human — no card understanding
+
+**Problem:** Connected trained agent (86% vs heuristic) to EDOPro for human testing. Agent exhibited fundamental misplays:
+- MST-ing its own backrow
+- Attacking with monsters that have lower ATK than opponent's
+- Book of Moon on its own monsters
+- Activating spells for no strategic reason
+- Setting cards pointlessly
+- Using card effects against itself
+
+85-90% vs heuristic is meaningless — the heuristic is so weak that random-ish play wins most games. The agent had no understanding of what its actions actually do.
+
+**Root cause:** Three observation gaps:
+1. **No target ownership context** — during SELECT_CARD (target for MST, Book of Moon), the observation didn't indicate whether each candidate card belonged to the agent or opponent
+2. **No card effect semantics** — the 64d embedding captured text similarity but zero gameplay meaning. No feature said "MST destroys spells/traps" or "Book of Moon flips face-down"
+3. **No ATK comparison at decision time** — the per-action tokens for attack actions didn't include opponent's monster ATK for comparison
+
+### Issue 84: EDOPro card selection response format (RETRY errors)
+
+**Problem:** Bot got MSG_RETRY when responding to SELECT_CARD in EDOPro. The local engine uses `set_responseb` with byte format (count + byte indices), but EDOPro's ygopro-core fork (edo9300) uses `parse_response_cards` which expects int32 format: `type(int32) + count(uint32) + indices(uint32 each)`.
+
+**Fix:** `DuelProxy.respond_card_selection` changed to int32 format: `struct.pack("<i", 0)` (type=0) + `struct.pack("<I", count)` + `struct.pack("<I", idx)` per index.
+
+### Issue 85: SORT_CARD unhandled — causes RETRY and disconnect
+
+**Problem:** EDOPro sent SORT_CARD (MSG 25) which the bot tried to handle with the model, producing invalid responses.
+
+**Fix:** Added explicit handler in bot's `_respond_to_decision`: if msg_type is SORT_CARD or SORT_CHAIN, respond with `-1` (auto-sort) instead of using the model.
+
+### Phase C Implementation: Structured Card Semantics (action_features 12 → 29)
+
+Three targeted upgrades to the action feature encoding, all touching `observation.py`:
+
+**C1. Per-card ownership flags (cols 12-13):**
+During SELECT_CARD, SELECT_TRIBUTE, and SELECT_CHAIN, each candidate card gets `target_is_mine` (col 12) and `target_is_opp` (col 13) flags based on `CardInfo.controller == perspective`. Stops 70% of self-MST/self-Book-of-Moon mistakes because the policy now sees "I'm about to destroy my own card."
+
+**C2. Effect category flags (cols 14-25):**
+New `effect_flags.py` lookup table mapping ~137 GOAT format card codes to 12 binary flags: destroys_monster, destroys_spelltrap, negates, draws_cards, searches_deck, flips_facedown, burns_lp, bounces_to_hand, special_summons, gains_atk, changes_position, protects. Appended to every action slot via `_encode_action_slot`. Unknown cards get all zeros (safe default).
+
+**C3. ATK matchup features (cols 26-28) for attack actions:**
+When building action features for `MsgSelectBattleCmd` attackable slots: computes strongest face-up opponent monster ATK from GameState, and whether opponent has face-down monsters. Each attacker gets: `target_atk_norm` (max opp ATK / 5000), `atk_advantage` ((my ATK - max opp ATK) / 5000, clamped [-1,1]), `opp_has_facedown`. The cross-attention action head can now learn "don't attack 1200 into 2400."
+
+**C4. Target-aware action head:**
+Effectively implemented by C1-C3 — the cross-attention action head already scores each action using its rich per-action token (now 29 features including ownership, effect type, and ATK matchup) combined with the LSTM latent. No additional architectural change needed.
+
+`encode_action_features` now accepts `perspective` and `state` parameters. All call sites updated (goat_env.py ×2, bot.py ×1). ACTION_FEATURES_DIM: 12 → 29. Extractor auto-adapts (dynamic shape). Checkpoints incompatible — training restarted from scratch.
+
 ---
 
 ## Critical Bugs Summary (by impact)
@@ -618,3 +790,5 @@ Removed curriculum system. All decks available from start.
 8. **Observation blind spots** (#58) — Missing turn count, relative advantage, graveyard contents.
 9. **Per-decision opponent mixing** (#63) — Opponent type changed mid-game, incoherent opponent behavior.
 10. **Single-deck training** (#65, #66) — Curriculum stuck at Goat Control only. Agent never exposed to diverse strategies.
+11. **BoardAttentionValueHead critic failure** (#79) — Cross-attention value head too hard to optimize. Explained variance declined during training. Agent plateaued at 65%.
+12. **No card understanding at decision time** (#83) — Agent couldn't distinguish own vs opponent cards during targeting, didn't know card effects, couldn't compare ATK values. 86% vs heuristic but played randomly vs humans.
