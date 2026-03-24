@@ -64,8 +64,26 @@ class SelfPlayCallback(BaseCallback):
         self._eval_env: Optional[GoatEnv] = None
 
     def _init_callback(self) -> None:
-        """Create the dedicated eval env in the main process."""
+        """Create the dedicated eval env and populate pool from existing checkpoints."""
         self._eval_env = GoatEnv()
+
+        # On resume: discover existing checkpoints and restore self-play state
+        existing = sorted(self.save_dir.glob("ckpt_*.zip"))
+        if existing:
+            for p in existing:
+                ckpt_id = p.stem
+                self.pool.append((p.with_suffix(""), ckpt_id))
+            # Fast-forward next checkpoint step past existing ones
+            last_step = int(self.pool[-1][1].split("_")[1])
+            self._next_checkpoint_step = last_step + self.checkpoint_interval
+            # Activate self-play if we already have enough checkpoints
+            if len(self.pool) >= 2 and not self.no_self_play:
+                self._self_play_active = True
+            if self.verbose and self.pool:
+                print(f"[SelfPlay] Restored {len(self.pool)} checkpoints from disk"
+                      f" (next checkpoint at step {self._next_checkpoint_step:,})")
+                if self._self_play_active:
+                    print("[SelfPlay] Self-play RE-ACTIVATED on resume")
 
     def _on_step(self) -> bool:
         if self.num_timesteps >= self._next_checkpoint_step:

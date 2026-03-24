@@ -76,6 +76,9 @@ def train(
     lstm_hidden_size: int = 256,
     n_lstm_layers: int = 1,
     shaping_scale: float = 0.5,
+    ent_coef: float = 0.10,
+    vf_coef: float = 0.5,
+    use_board_attention: bool = True,
     verbose: int = 1,
 ):
     """
@@ -144,6 +147,8 @@ def train(
             batch_size=batch_size,
             learning_rate=learning_rate,
             n_epochs=n_epochs,
+            ent_coef=ent_coef,
+            vf_coef=vf_coef,
         )
         if verbose:
             print(f"  Injecting hyperparams: {custom_objects}")
@@ -159,7 +164,7 @@ def train(
             tb_log = None
 
         extractor_kwargs = dict(
-            embed_dim=32,
+            embed_dim=64,
             hidden_dim=512,
             vocab_size=vocab_size,
             d_model=64,
@@ -176,6 +181,7 @@ def train(
             n_lstm_layers=n_lstm_layers,
             enable_critic_lstm=True,
             shared_lstm=False,
+            use_board_attention=use_board_attention,
         )
 
         model = MaskableRecurrentPPO(
@@ -188,7 +194,8 @@ def train(
             n_epochs=n_epochs,
             gamma=0.99,
             learning_rate=learning_rate,
-            ent_coef=0.10,
+            ent_coef=ent_coef,
+            vf_coef=vf_coef,
             clip_range=0.2,
             tensorboard_log=tb_log,
         )
@@ -221,6 +228,9 @@ def train(
         print(f"  batch_size:          {batch_size}")
         print(f"  n_epochs:            {n_epochs}")
         print(f"  learning_rate:       {learning_rate}")
+        print(f"  ent_coef:            {ent_coef}")
+        print(f"  vf_coef:             {vf_coef}")
+        print(f"  board_attention:     {use_board_attention}")
         print(f"  Save directory:      {save_path}")
         print(f"  Device:              {model.device}")
         print("=" * 60)
@@ -301,6 +311,12 @@ if __name__ == "__main__":
                         help="Number of LSTM layers")
     parser.add_argument("--shaping-scale", type=float, default=0.5,
                         help="PBRS reward shaping scale (0 = disabled)")
+    parser.add_argument("--ent-coef", type=float, default=0.10,
+                        help="Entropy coefficient")
+    parser.add_argument("--vf-coef", type=float, default=0.5,
+                        help="Value function coefficient")
+    parser.add_argument("--no-board-attention", action="store_true",
+                        help="Disable cross-attention value head (use Linear instead)")
     args = parser.parse_args()
 
     train(
@@ -322,4 +338,7 @@ if __name__ == "__main__":
         lstm_hidden_size=args.lstm_hidden_size,
         n_lstm_layers=args.n_lstm_layers,
         shaping_scale=args.shaping_scale,
+        ent_coef=args.ent_coef,
+        vf_coef=args.vf_coef,
+        use_board_attention=not args.no_board_attention,
     )
