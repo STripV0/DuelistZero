@@ -2,9 +2,9 @@
 Three-segment transformer feature extractor with learnable card embeddings.
 
 Architecture:
-  Board tokens:   card_ids(50) → embed(32) → Linear(32, 64) → (50, 64)
-  Action tokens:  action_features(71,12) → embed col0(32) + cols1-11 → Linear(43, 64) → (71, 64)
-  History tokens: action_history(16,10) → embed col0(32) + cols1-9 → Linear(41, 64) → (16, 64)
+  Board tokens:   card_ids(50) → embed(64) → Identity (64=d_model) → (50, 64)
+  Action tokens:  action_features(71,12) → embed col0(64) + cols1-11 → Linear(75, 64) → (71, 64)
+  History tokens: action_history(16,13) → embed col0(64) + cols1-12 → Linear(76, 64) → (16, 64)
 
   + segment_embedding(3, 64): board=0, action=1, history=2
   → concat: (137, 64)
@@ -12,11 +12,13 @@ Architecture:
   → segment-aware masked mean pooling: board_pool(64) | action_pool(64) | history_pool(64)
   → Linear(192, 256) + ReLU → embed_stream(256)
 
-  Side output: per-action transformer tokens (batch, 71, 64) stored in _last_action_tokens
-  for the cross-attention action head (padded positions zeroed).
+  Side outputs stored for cross-attention heads:
+    _last_action_tokens: (batch, 71, 64) for cross-attention action head
+    _last_board_tokens:  (batch, 50, 64) for cross-attention value head (B3)
+  Padded positions are zeroed.
 
-  Merge: features(453) | embed_stream(256) = 709
-  → Linear(709, 256) → ReLU → Linear(256, 256) → ReLU → output(256)
+  Merge: features(462) | embed_stream(256) = 718
+  → Linear(718, 256) → ReLU → Linear(256, 256) → ReLU → output(256)
 """
 
 import numpy as np
@@ -66,7 +68,7 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
     def __init__(
         self,
         observation_space: spaces.Dict,
-        embed_dim: int = 32,
+        embed_dim: int = 64,
         hidden_dim: int = 256,
         vocab_size: int = 14337,
         pretrained_embeddings_path: str | None = None,
@@ -79,10 +81,11 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
         features_dim = observation_space["features"].shape[0]
         self._num_card_slots = observation_space["card_ids"].shape[0]  # 50
         self._action_feat_shape = observation_space["action_features"].shape  # (71, 12)
-        self._history_shape = observation_space["action_history"].shape  # (16, 10)
+        self._history_shape = observation_space["action_history"].shape  # (16, 13)
         self._embed_dim = embed_dim
         self._d_model = d_model
         self._last_action_tokens: torch.Tensor | None = None
+        self._last_board_tokens: torch.Tensor | None = None  # B3: for value head
 
         # Shared card embedding
         self.embedding = nn.Embedding(
@@ -103,12 +106,16 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
             self.embedding.weight.data.copy_(pretrained)
 
         # Token projections
-        self.board_project = nn.Linear(embed_dim, d_model)
+        # B4: When embed_dim == d_model, board_project is identity (saves params)
+        if embed_dim == d_model:
+            self.board_project = nn.Identity()
+        else:
+            self.board_project = nn.Linear(embed_dim, d_model)
         # action_features: col 0 = card_id (embedded), cols 1-11 = 11 continuous
         n_action_continuous = self._action_feat_shape[1] - 1  # 11
         self.action_project = TokenProjection(embed_dim, n_action_continuous, d_model)
-        # action_history: col 0 = card_id (embedded), cols 1-9 = 9 continuous
-        n_history_continuous = self._history_shape[1] - 1  # 9
+        # action_history: col 0 = card_id (embedded), cols 1-N = continuous
+        n_history_continuous = self._history_shape[1] - 1  # 12 (B1: was 9)
         self.history_project = TokenProjection(embed_dim, n_history_continuous, d_model)
 
         # Segment embeddings: 0=board, 1=action, 2=history
@@ -143,6 +150,11 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
     @property
     def action_token_dim(self) -> int:
         """Dimension of per-action transformer output tokens."""
+        return self._d_model
+
+    @property
+    def board_token_dim(self) -> int:
+        """Dimension of per-board transformer output tokens."""
         return self._d_model
 
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -210,6 +222,8 @@ class CardEmbeddingExtractor(BaseFeaturesExtractor):
         # Store per-action transformer outputs for cross-attention action head
         # Zero out padded positions so invalid actions get clean zero vectors
         self._last_action_tokens = action_out * (~action_pad).unsqueeze(-1).float()
+        # B3: Store board tokens for cross-attention value head
+        self._last_board_tokens = board_out * (~board_pad).unsqueeze(-1).float()
 
         board_pool = self._masked_mean(board_out, ~board_pad)
         action_pool = self._masked_mean(action_out, ~action_pad)

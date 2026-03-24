@@ -4,7 +4,7 @@ Observation encoder for the GoatEnv.
 Converts a GameState into a flat float32 numpy array that the RL agent
 can consume. All values are normalized to [0, 1] or [-1, 1].
 
-Layout (OBSERVATION_DIM = 453):
+Layout (OBSERVATION_DIM = 462):
   [0-9]     scalars (LP, hand, deck, GY, banished × 2)
   [10-17]   phase one-hot (8 phases)
   [18]      turn player flag
@@ -16,10 +16,13 @@ Layout (OBSERVATION_DIM = 453):
   [233-282] opp spell/trap zone: 5 × 10
   [283-432] my hand: 10 × 15
   [433-452] deck identity one-hot (20)
+  [453-461] opponent inference features (B2): extra draws, facedown count,
+            S/T age × 5, GY monster count, banished count
 
 Separate observation keys:
-  action_features: (71, 12) — rich per-action features with card IDs, types, stats
-  action_history:  (16, 10) — structured history with card IDs and types
+  action_features: (71, 29) — rich per-action features with card IDs, types, stats,
+                            ownership flags (C1), effect categories (C2), ATK matchup (C3)
+  action_history:  (16, 13) — structured history with card IDs, types, and outcomes
 """
 
 import sqlite3
@@ -29,7 +32,7 @@ from typing import Optional
 import numpy as np
 
 from ..core.constants import LOCATION, POSITION, PHASE, TYPE, ATTRIBUTE
-from ..engine.game_state import GameState, ZoneCard
+from ..engine.game_state import GameState, PlayerState, ZoneCard
 from .card_index import CardIndex
 
 
@@ -51,6 +54,9 @@ _HAND_DIM = 10 * _HAND_SLOT_DIM              # 80
 MAX_DECKS = 20                               # capacity for deck identity one-hot
 _DECK_ID_DIM = MAX_DECKS                     # 20
 
+# B2: Opponent inference features
+_OPP_INFERENCE_DIM = 9  # extra_draws, facedown_count, 5×ST_age, GY_monster_count, banished_count
+
 OBSERVATION_DIM = (
     _SCALAR_DIM +
     _PHASE_DIM +
@@ -60,17 +66,22 @@ OBSERVATION_DIM = (
     2 * _MONSTER_ZONE_DIM +   # my + opp
     2 * _SPELL_ZONE_DIM +     # my + opp
     _HAND_DIM +
-    _DECK_ID_DIM
+    _DECK_ID_DIM +
+    _OPP_INFERENCE_DIM
 )
-# = 10 + 8 + 1 + 1 + 3 + 160 + 100 + 150 + 20 = 453
+# = 10 + 8 + 1 + 1 + 3 + 160 + 100 + 150 + 20 + 9 = 462
 
-# Rich action features: 12 features per action slot
-ACTION_FEATURES_DIM = 12
+# Rich action features: 29 features per action slot
+# [0] card_id, [1-7] action type one-hots, [8-10] ATK/DEF/level, [11] location,
+# [12-13] target ownership (C1), [14-25] effect category flags (C2),
+# [26-28] ATK matchup features (C3)
+ACTION_FEATURES_DIM = 29
 ACTION_FEATURES_SLOTS = 71
 
-# Structured action history: 10 features per entry, 16 entries
+# Structured action history: 13 features per entry, 16 entries
+# B1: Added damage/8000, cards_destroyed/5, was_negated
 HISTORY_LENGTH = 16
-HISTORY_FEATURES_DIM = 10
+HISTORY_FEATURES_DIM = 13
 
 # Card ID observation: 50 slots for embedding lookup
 # [0-4] my monsters, [5-9] my S/T, [10-14] opp monsters (face-up only),
@@ -249,10 +260,13 @@ def _encode_action_slot(
     db: Optional[CardDB],
 ) -> np.ndarray:
     """
-    Encode a single action slot into ACTION_FEATURES_DIM (12) floats.
-    [card_id, is_summon, is_spsummon, is_set, is_activate, is_attack,
-     is_reposition, is_phase_pass_other, ATK/5000, DEF/5000, level/12, location]
+    Encode a single action slot into ACTION_FEATURES_DIM (29) floats.
+    [0] card_id, [1-7] action type one-hots, [8-10] ATK/DEF/level,
+    [11] location, [12-13] ownership (filled by caller), [14-25] effect flags
+    [26-28] ATK matchup (filled by caller)
     """
+    from .effect_flags import get_effect_flags
+
     v = np.zeros(ACTION_FEATURES_DIM, dtype=np.float32)
     if card_code != 0:
         v[0] = float(card_index.code_to_index(card_code))
@@ -264,6 +278,9 @@ def _encode_action_slot(
             v[9] = min(data["def"], 5000) / 5000.0 if data["def"] >= 0 else 0.0
             v[10] = min(data["level"], 12) / 12.0
     v[11] = _encode_location(location)
+    # C2: Effect category flags (cols 14-25)
+    if card_code != 0:
+        v[14:26] = get_effect_flags(card_code)
     return v
 
 
@@ -281,11 +298,14 @@ def encode_action_features(
     msg,
     card_index: 'CardIndex',
     db: Optional[CardDB] = None,
+    perspective: int = 0,
+    state: Optional['GameState'] = None,
 ) -> np.ndarray:
     """
     Encode rich per-action features for all 71 action slots.
 
     Returns float32 array of shape (ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM).
+    Includes C1 ownership flags, C2 effect flags, and C3 ATK matchup features.
     """
     from ..core.message_parser import (
         MsgSelectIdleCmd,
@@ -320,11 +340,30 @@ def encode_action_features(
             arr[36, _ACT_OTHER] = 1.0
 
     elif isinstance(msg, MsgSelectBattleCmd):
+        # C3: Compute opponent's strongest face-up ATK for matchup features
+        max_opp_atk = 0
+        opp_has_facedown = False
+        if state is not None and db is not None:
+            opp = state.players[1 - perspective]
+            for m in opp.monsters:
+                if m is not None:
+                    if m.position & POSITION.FACEUP:
+                        opp_data = db.get(m.code & 0x7FFFFFFF)
+                        if opp_data and opp_data["atk"] >= 0:
+                            max_opp_atk = max(max_opp_atk, opp_data["atk"])
+                    if m.position & POSITION.FACEDOWN:
+                        opp_has_facedown = True
+
         for i, a in enumerate(msg.attackable[:5]):
             if a.card is not None:
                 arr[37 + i] = _encode_action_slot(
                     a.card.code, _ACT_ATTACK, a.card.location, card_index, db
                 )
+                # C3: ATK matchup features (cols 26-28)
+                my_atk_raw = arr[37 + i, 8] * 5000.0  # decode from normalized
+                arr[37 + i, 26] = min(max_opp_atk, 5000) / 5000.0
+                arr[37 + i, 27] = max(-1.0, min(1.0, (my_atk_raw - max_opp_atk) / 5000.0))
+                arr[37 + i, 28] = float(opp_has_facedown)
         for i, c in enumerate(msg.activatable[:5]):
             arr[42 + i] = _encode_action_slot(c.code, _ACT_ACTIVATE, c.location, card_index, db)
         # toM2 (47), toEP (48)
@@ -336,10 +375,20 @@ def encode_action_features(
     elif isinstance(msg, (MsgSelectCard, MsgSelectTribute)):
         for i, c in enumerate(msg.cards[:10]):
             arr[51 + i] = _encode_action_slot(c.code, _ACT_OTHER, c.location, card_index, db)
+            # C1: Ownership flags (cols 12-13)
+            if c.controller == perspective:
+                arr[51 + i, 12] = 1.0  # target_is_mine
+            else:
+                arr[51 + i, 13] = 1.0  # target_is_opp
 
     elif isinstance(msg, MsgSelectChain):
         for i, c in enumerate(msg.cards[:10]):
             arr[51 + i] = _encode_action_slot(c.code, _ACT_ACTIVATE, c.location, card_index, db)
+            # C1: Ownership flags for chain targets too
+            if c.controller == perspective:
+                arr[51 + i, 12] = 1.0
+            else:
+                arr[51 + i, 13] = 1.0
 
     elif isinstance(msg, MsgSelectEffectYn):
         arr[49] = _encode_action_slot(msg.code, _ACT_ACTIVATE, msg.location, card_index, db)
@@ -388,6 +437,10 @@ def encode_action_history(
                 v[8] = min(data["def"], 5000) / 5000.0 if data["def"] >= 0 else 0.0
         # Turns ago
         v[9] = min(max(current_turn - action.turn, 0), 40) / 40.0
+        # B1: Outcome features
+        v[10] = min(action.extra_info.get("damage", 0), 8000) / 8000.0
+        v[11] = min(action.extra_info.get("destroyed", 0), 5) / 5.0
+        v[12] = float(action.extra_info.get("was_negated", False))
 
     return arr
 
@@ -504,6 +557,42 @@ def encode_observation(
     if 0 <= deck_id < MAX_DECKS:
         obs[idx + deck_id] = 1.0
     idx += _DECK_ID_DIM
+
+    # --- B2: Opponent inference features ---
+    obs[idx] = min(opp.extra_draws, 5) / 5.0
+    idx += 1
+
+    # Opponent face-down card count
+    opp_facedown = sum(
+        1 for m in opp.monsters if m is not None and bool(m.position & POSITION.FACEDOWN)
+    ) + sum(
+        1 for s in opp.spells if s is not None and bool(s.position & POSITION.FACEDOWN)
+    )
+    obs[idx] = min(opp_facedown, 5) / 5.0
+    idx += 1
+
+    # Opponent S/T zone age (turns since set)
+    for slot in range(5):
+        card = opp.spells[slot] if slot < len(opp.spells) else None
+        if card is not None and card.set_turn > 0:
+            obs[idx] = min(state.current_turn - card.set_turn, 10) / 10.0
+        idx += 1
+
+    # Opponent graveyard monster count (requires db)
+    if db is not None:
+        opp_gy_monsters = sum(
+            1 for code in opp.graveyard
+            if code != 0 and (d := db.get(code & 0x7FFFFFFF)) is not None
+            and bool(d["type"] & TYPE.MONSTER)
+        )
+    else:
+        opp_gy_monsters = 0
+    obs[idx] = min(opp_gy_monsters, 10) / 10.0
+    idx += 1
+
+    # Opponent banished count
+    obs[idx] = min(opp.banished_count, 10) / 10.0
+    idx += 1
 
     assert idx == OBSERVATION_DIM, f"Observation dim mismatch: {idx} != {OBSERVATION_DIM}"
     return obs

@@ -13,6 +13,10 @@ from duelist_zero.env.observation import (
 )
 from duelist_zero.env.action_space import ACTION_DIM
 
+# Sanity check dimensions match expected values after B1+B2 changes
+assert OBSERVATION_DIM == 462, f"Expected OBSERVATION_DIM=462, got {OBSERVATION_DIM}"
+assert HISTORY_FEATURES_DIM == 13, f"Expected HISTORY_FEATURES_DIM=13, got {HISTORY_FEATURES_DIM}"
+
 
 @pytest.fixture(scope="module")
 def env():

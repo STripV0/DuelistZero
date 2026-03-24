@@ -15,10 +15,10 @@ from duelist_zero.network.extractor import CardEmbeddingExtractor
 def obs_space():
     """Observation space matching GoatEnv defaults."""
     return spaces.Dict({
-        "features": spaces.Box(low=-1, high=1, shape=(453,), dtype=np.float32),
+        "features": spaces.Box(low=-1, high=1, shape=(462,), dtype=np.float32),
         "card_ids": spaces.Box(low=0, high=14336, shape=(50,), dtype=np.float32),
-        "action_features": spaces.Box(low=0, high=14336, shape=(71, 12), dtype=np.float32),
-        "action_history": spaces.Box(low=0, high=14336, shape=(16, 10), dtype=np.float32),
+        "action_features": spaces.Box(low=0, high=14336, shape=(71, 29), dtype=np.float32),
+        "action_history": spaces.Box(low=0, high=14336, shape=(16, 13), dtype=np.float32),
     })
 
 
@@ -26,16 +26,16 @@ def obs_space():
 def sample_obs(obs_space):
     """Batch of 4 random observations."""
     return {
-        "features": torch.randn(4, 453),
+        "features": torch.randn(4, 462),
         "card_ids": torch.randint(0, 100, (4, 50)).float(),
         "action_features": _make_action_features(4),
-        "action_history": _make_action_history(4),
+        "action_history": _make_action_history(4, 13),
     }
 
 
 def _make_action_features(batch_size: int) -> torch.Tensor:
-    """Create realistic action_features: col 0 = card_id, cols 1-11 = continuous."""
-    af = torch.zeros(batch_size, 71, 12)
+    """Create realistic action_features: col 0 = card_id, cols 1-28 = continuous."""
+    af = torch.zeros(batch_size, 71, 29)
     # Populate a few action slots with card IDs and features
     af[:, 0, 0] = 42.0  # card_id for summon slot 0
     af[:, 0, 1] = 1.0   # is_summon
@@ -47,12 +47,16 @@ def _make_action_features(batch_size: int) -> torch.Tensor:
     af[:, 37, 5] = 1.0   # is_attack
     af[:, 37, 8] = 0.6   # ATK
     af[:, 37, 11] = 0.4  # location = mzone
+    af[:, 37, 26] = 0.4  # C3: target_atk_norm
+    af[:, 37, 27] = 0.2  # C3: atk_advantage
+    af[:, 51, 12] = 1.0  # C1: target_is_mine
+    af[:, 52, 13] = 1.0  # C1: target_is_opp
     return af
 
 
-def _make_action_history(batch_size: int) -> torch.Tensor:
-    """Create realistic action_history: col 0 = card_id, cols 1-9 = continuous."""
-    ah = torch.zeros(batch_size, 16, 10)
+def _make_action_history(batch_size: int, n_features: int = 13) -> torch.Tensor:
+    """Create realistic action_history: col 0 = card_id, cols 1-N = continuous."""
+    ah = torch.zeros(batch_size, 16, n_features)
     # Populate last 3 history slots (right-aligned)
     ah[:, 13, 0] = 5.0   # card_id
     ah[:, 13, 2] = 1.0   # is_summon
@@ -91,7 +95,7 @@ def test_has_transformer_and_segments(obs_space):
 def test_pretrained_embeddings_load(obs_space, sample_obs):
     """Pretrained embeddings should be loaded into the embedding layer."""
     vocab_size = 200
-    embed_dim = 32
+    embed_dim = 64
     pretrained = np.random.randn(vocab_size, embed_dim).astype(np.float32)
 
     with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
@@ -119,7 +123,7 @@ def test_pretrained_embeddings_load(obs_space, sample_obs):
 def test_padding_idx_zero_after_init(obs_space):
     """Padding index 0 should remain zero even with pretrained weights."""
     vocab_size = 200
-    embed_dim = 32
+    embed_dim = 64
     pretrained = np.ones((vocab_size, embed_dim), dtype=np.float32)
 
     with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
@@ -146,7 +150,7 @@ def test_pretrained_shape_mismatch(obs_space):
 
     with pytest.raises(AssertionError, match="Pretrained embeddings shape"):
         CardEmbeddingExtractor(
-            obs_space, embed_dim=32, hidden_dim=512, vocab_size=200,
+            obs_space, embed_dim=64, hidden_dim=512, vocab_size=200,
             pretrained_embeddings_path=tmp_path,
         )
 
@@ -167,10 +171,10 @@ def test_all_padded_no_nan(obs_space):
     """All-zero inputs (fully padded) should produce valid output, no NaN."""
     extractor = CardEmbeddingExtractor(obs_space, hidden_dim=256, vocab_size=200)
     obs = {
-        "features": torch.zeros(2, 453),
+        "features": torch.zeros(2, 462),
         "card_ids": torch.zeros(2, 50),
-        "action_features": torch.zeros(2, 71, 12),
-        "action_history": torch.zeros(2, 16, 10),
+        "action_features": torch.zeros(2, 71, 29),
+        "action_history": torch.zeros(2, 16, 13),
     }
     out = extractor(obs)
     assert out.shape == (2, 256)
@@ -180,16 +184,16 @@ def test_all_padded_no_nan(obs_space):
 def test_phase_transition_actions(obs_space):
     """Phase transition actions (no card, just action_type flag) should work."""
     extractor = CardEmbeddingExtractor(obs_space, hidden_dim=256, vocab_size=200)
-    af = torch.zeros(2, 71, 12)
+    af = torch.zeros(2, 71, 29)
     # toBP action (index 35): no card_id, just is_phase_pass_other flag
     af[:, 35, 7] = 1.0  # col 7 = is_phase_pass_other
     # toEP action (index 36)
     af[:, 36, 7] = 1.0
     obs = {
-        "features": torch.randn(2, 453),
+        "features": torch.randn(2, 462),
         "card_ids": torch.randint(0, 100, (2, 50)).float(),
         "action_features": af,
-        "action_history": torch.zeros(2, 16, 10),
+        "action_history": torch.zeros(2, 16, 13),
     }
     out = extractor(obs)
     assert out.shape == (2, 256)
@@ -221,15 +225,15 @@ def test_last_action_tokens_shape(obs_space, sample_obs):
 def test_last_action_tokens_padded_zero(obs_space):
     """Padded action positions should have zero-valued tokens."""
     extractor = CardEmbeddingExtractor(obs_space, hidden_dim=256, vocab_size=200)
-    af = torch.zeros(2, 71, 12)
+    af = torch.zeros(2, 71, 29)
     # Only populate slot 0 — all other slots are padded (card_id=0, continuous=0)
     af[:, 0, 0] = 42.0
     af[:, 0, 1] = 1.0
     obs = {
-        "features": torch.randn(2, 453),
+        "features": torch.randn(2, 462),
         "card_ids": torch.randint(0, 100, (2, 50)).float(),
         "action_features": af,
-        "action_history": torch.zeros(2, 16, 10),
+        "action_history": torch.zeros(2, 16, 13),
     }
     extractor(obs)
     tokens = extractor._last_action_tokens
@@ -237,3 +241,30 @@ def test_last_action_tokens_padded_zero(obs_space):
     assert tokens[:, 0].abs().sum() > 0
     # Slots 1-70 are all padded — should be zero
     assert torch.allclose(tokens[:, 1:], torch.zeros_like(tokens[:, 1:]))
+
+
+def test_last_board_tokens_shape(obs_space, sample_obs):
+    """_last_board_tokens should have shape (B, 50, d_model) after forward."""
+    extractor = CardEmbeddingExtractor(obs_space, hidden_dim=256, vocab_size=200)
+    assert extractor._last_board_tokens is None
+    extractor(sample_obs)
+    tokens = extractor._last_board_tokens
+    assert tokens is not None
+    assert tokens.shape == (4, 50, 64)
+    assert not torch.isnan(tokens).any()
+
+
+def test_board_project_identity_when_embed_matches_d_model(obs_space):
+    """When embed_dim == d_model, board_project should be Identity."""
+    extractor = CardEmbeddingExtractor(
+        obs_space, embed_dim=64, hidden_dim=256, vocab_size=200, d_model=64
+    )
+    assert isinstance(extractor.board_project, torch.nn.Identity)
+
+
+def test_board_project_linear_when_embed_differs(obs_space):
+    """When embed_dim != d_model, board_project should be Linear."""
+    extractor = CardEmbeddingExtractor(
+        obs_space, embed_dim=32, hidden_dim=256, vocab_size=200, d_model=64
+    )
+    assert isinstance(extractor.board_project, torch.nn.Linear)

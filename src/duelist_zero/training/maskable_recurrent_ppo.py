@@ -53,7 +53,55 @@ from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
 
-# ─── Cross-attention action head ─────────────────────────────────────────────
+# ─── Cross-attention heads ───────────────────────────────────────────────────
+
+
+class BoardAttentionValueHead(nn.Module):
+    """Value head that attends over board tokens before producing V(s).
+
+    Single-head cross-attention: latent_vf as query, board tokens as K/V.
+    Attention-pooled board context is concatenated with latent_vf and projected
+    to a scalar value estimate. This lets the critic assess specific board
+    positions (e.g. "3000 ATK threat in Zone 2") instead of relying solely on
+    mean-pooled board information.
+    """
+
+    def __init__(self, latent_dim: int, board_token_dim: int):
+        super().__init__()
+        self.query_proj = nn.Linear(latent_dim, board_token_dim)
+        self.output = nn.Linear(latent_dim + board_token_dim, 1)
+        self._board_token_dim = board_token_dim
+
+    def forward(self, latent_vf: th.Tensor, board_tokens: th.Tensor | None = None) -> th.Tensor:
+        """
+        Args:
+            latent_vf: (B, latent_dim) critic latent from LSTM + MLP
+            board_tokens: (B, 50, board_token_dim) from extractor, or None
+        Returns:
+            values: (B, 1)
+        """
+        if board_tokens is None:
+            # Fallback: zero board context (shouldn't happen in normal training)
+            zeros = th.zeros(
+                latent_vf.shape[0], self._board_token_dim,
+                device=latent_vf.device, dtype=latent_vf.dtype,
+            )
+            return self.output(th.cat([latent_vf, zeros], dim=-1))
+
+        # Single-head attention
+        query = self.query_proj(latent_vf).unsqueeze(1)  # (B, 1, board_token_dim)
+        scale = board_tokens.shape[-1] ** 0.5
+        attn_scores = th.bmm(query, board_tokens.transpose(1, 2)) / scale  # (B, 1, 50)
+
+        # Mask padded positions (all-zero tokens)
+        pad_mask = board_tokens.abs().sum(dim=-1) == 0  # (B, 50)
+        attn_scores = attn_scores.masked_fill(pad_mask.unsqueeze(1), float('-inf'))
+        attn_weights = th.softmax(attn_scores, dim=-1)
+        # Handle all-padded case (all -inf → NaN after softmax)
+        attn_weights = attn_weights.nan_to_num(0.0)
+
+        attended = th.bmm(attn_weights, board_tokens).squeeze(1)  # (B, board_token_dim)
+        return self.output(th.cat([latent_vf, attended], dim=-1))
 
 
 class CrossAttentionActionHead(nn.Module):
@@ -342,7 +390,9 @@ class MaskableRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
         shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
         lstm_kwargs: Optional[dict[str, Any]] = None,
+        use_board_attention: bool = True,
     ):
+        self._use_board_attention = use_board_attention
         super().__init__(
             observation_space,
             action_space,
@@ -380,7 +430,14 @@ class MaskableRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
             latent_dim=self.mlp_extractor.latent_dim_pi,
             action_token_dim=self.features_extractor.action_token_dim,
         )
-        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
+        # B3: Cross-attention value head over board tokens (togglable)
+        if self._use_board_attention:
+            self.value_net = BoardAttentionValueHead(
+                latent_dim=self.mlp_extractor.latent_dim_vf,
+                board_token_dim=self.features_extractor.board_token_dim,
+            )
+        else:
+            self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
 
         if self.ortho_init:
             module_gains = {
@@ -404,6 +461,14 @@ class MaskableRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
             lr=lr_schedule(1),
             **self.optimizer_kwargs,
         )
+
+    def _get_board_tokens(self) -> th.Tensor | None:
+        """Retrieve board tokens from the value features extractor."""
+        if self.share_features_extractor:
+            ext = self.features_extractor
+        else:
+            ext = self.vf_features_extractor
+        return getattr(ext, '_last_board_tokens', None)
 
     def _get_action_dist_from_latent(
         self, latent_pi: th.Tensor
@@ -451,7 +516,10 @@ class MaskableRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
         latent_pi = self.mlp_extractor.forward_actor(latent_pi)
         latent_vf = self.mlp_extractor.forward_critic(latent_vf)
 
-        values = self.value_net(latent_vf)
+        if isinstance(self.value_net, BoardAttentionValueHead):
+            values = self.value_net(latent_vf, self._get_board_tokens())
+        else:
+            values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
         if action_masks is not None:
             distribution.apply_masking(action_masks)
@@ -498,7 +566,10 @@ class MaskableRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
         if action_masks is not None:
             distribution.apply_masking(action_masks)
         log_prob = distribution.log_prob(actions)
-        values = self.value_net(latent_vf)
+        if isinstance(self.value_net, BoardAttentionValueHead):
+            values = self.value_net(latent_vf, self._get_board_tokens())
+        else:
+            values = self.value_net(latent_vf)
         return values, log_prob, distribution.entropy()
 
     def get_distribution(

@@ -21,7 +21,7 @@ from sklearn.decomposition import PCA
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = PROJECT_ROOT / "data" / "cards.cdb"
 OUTPUT_PATH = PROJECT_ROOT / "data" / "card_embeddings.npy"
-EMBED_DIM = 32
+EMBED_DIM = 64
 
 
 def main():
