@@ -6,14 +6,23 @@ shaping (PBRS, Ng et al. 1999) using the difference gamma*Phi(s') - Phi(s).
 PBRS is mathematically guaranteed to preserve the optimal policy.
 """
 
+from typing import Optional
+
+from ..core.constants import POSITION
 from ..engine.game_state import GameState
 
 
-def compute_potential(state: GameState, perspective: int) -> float:
+def compute_potential(state: GameState, perspective: int, db=None) -> float:
     """
     Compute the potential function Phi(s) for PBRS.
 
-    Uses only public game state — no DB lookups required.
+    Hybrid potential balancing board power, card advantage, and LP:
+      Φ(s) = w1 * atk_adv + w2 * card_adv + w3 * lp_adv
+
+    When db is available, atk_adv uses ATK-weighted board power of face-up
+    monsters (so tributing 2 weak → 1 strong registers as improvement).
+    Falls back to count-based board_adv when db is None.
+
     Returns a value roughly in [-1, 1].
     """
     me = state.players[perspective]
@@ -22,15 +31,32 @@ def compute_potential(state: GameState, perspective: int) -> float:
     # LP advantage: clipped to [-1, 1]
     lp_adv = max(-1.0, min(1.0, (me.lp - opp.lp) / 8000.0))
 
-    # Board (monster) advantage: [-1, 1]
-    board_adv = (me.monster_count - opp.monster_count) / 5.0
+    # ATK-weighted board power (or count-based fallback)
+    if db is not None:
+        my_atk_sum = 0.0
+        for m in me.monsters:
+            if m is not None and bool(m.position & POSITION.FACEUP):
+                data = db.get(m.code & 0x7FFFFFFF)
+                if data and data["atk"] >= 0:
+                    my_atk_sum += data["atk"] / 5000.0
+        opp_atk_sum = 0.0
+        for m in opp.monsters:
+            if m is not None and bool(m.position & POSITION.FACEUP):
+                data = db.get(m.code & 0x7FFFFFFF)
+                if data and data["atk"] >= 0:
+                    opp_atk_sum += data["atk"] / 5000.0
+        atk_adv = max(-1.0, min(1.0, my_atk_sum - opp_atk_sum))
+    else:
+        # Fallback: count-based board advantage
+        atk_adv = max(-1.0, min(1.0,
+            (me.monster_count - opp.monster_count) / 5.0))
 
     # Total card advantage (hand + monsters + spells): clipped to [-1, 1]
     my_cards = me.hand_count + me.monster_count + me.spell_count
     opp_cards = opp.hand_count + opp.monster_count + opp.spell_count
     card_adv = max(-1.0, min(1.0, (my_cards - opp_cards) / 10.0))
 
-    return 0.4 * lp_adv + 0.35 * board_adv + 0.25 * card_adv
+    return 0.40 * atk_adv + 0.25 * card_adv + 0.35 * lp_adv
 
 
 def compute_reward(

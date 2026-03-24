@@ -8,7 +8,7 @@ updated by processing engine messages.
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ..core.constants import LOCATION
+from ..core.constants import LOCATION, MSG, PHASE
 from ..core.message_parser import (
     ParsedMessage,
     MsgStart,
@@ -37,6 +37,7 @@ class ZoneCard:
     position: int = 0  # POSITION flags
     controller: int = 0
     sequence: int = 0
+    set_turn: int = 0  # Turn number when this card was placed (for age tracking)
 
 
 @dataclass
@@ -50,6 +51,7 @@ class PlayerState:
     banished: list[int] = field(default_factory=list)      # card codes
     deck_count: int = 40
     extra_count: int = 0
+    extra_draws: int = 0  # Draws beyond normal draw-phase draw (for opponent inference)
 
     @property
     def hand_count(self) -> int:
@@ -99,6 +101,9 @@ class GameState:
     # Action history (public actions visible to both players)
     action_history: list[ActionRecord] = field(default_factory=list)
 
+    # B1: Pending attack record for damage attribution
+    _pending_attack_record: Optional[ActionRecord] = field(default=None, repr=False)
+
     # Duel result
     winner: int = -1  # -1 = ongoing, 0/1 = player won
     is_finished: bool = False
@@ -126,6 +131,7 @@ class GameState:
         self.current_phase = 0
         self.chain_count = 0
         self.action_history = []
+        self._pending_attack_record = None
         self.winner = -1
         self.is_finished = False
 
@@ -153,16 +159,25 @@ def update_state(state: GameState, msg: ParsedMessage) -> None:
 
     elif isinstance(msg, MsgNewPhase):
         state.current_phase = msg.phase
+        state._pending_attack_record = None  # Clear stale attack pointer
 
     elif isinstance(msg, MsgDraw):
         p = state.players[msg.player]
         for code in msg.cards:
             p.hand.append(code & 0x7FFFFFFF)
         p.deck_count = max(0, p.deck_count - len(msg.cards))
+        # Track extra draws (beyond normal draw-phase draw)
+        if state.current_phase != PHASE.DRAW:
+            p.extra_draws += len(msg.cards)
         state.record_action(msg.player, "draw", extra={"count": len(msg.cards)})
 
     elif isinstance(msg, MsgDamage):
         state.players[msg.player].lp = max(0, state.players[msg.player].lp - msg.amount)
+        # B1: Attribute damage to pending attack record
+        if state._pending_attack_record is not None:
+            rec = state._pending_attack_record
+            rec.extra_info["damage"] = rec.extra_info.get("damage", 0) + msg.amount
+            state._pending_attack_record = None
 
     elif isinstance(msg, MsgRecover):
         state.players[msg.player].lp += msg.amount
@@ -184,11 +199,19 @@ def update_state(state: GameState, msg: ParsedMessage) -> None:
 
     elif isinstance(msg, MsgChaining):
         state.chain_count = msg.chain_count
+        state._pending_attack_record = None  # Chain resolution clears attack context
         state.record_action(msg.player, "activate", msg.code)
 
     elif isinstance(msg, MsgAttack):
-        state.record_action(msg.attacker_player, "attack",
-                            extra={"target_player": msg.target_player})
+        record = ActionRecord(
+            turn=state.current_turn,
+            player=msg.attacker_player,
+            action_type="attack",
+            card_code=0,
+            extra_info={"target_player": msg.target_player, "damage": 0, "destroyed": 0},
+        )
+        state.action_history.append(record)
+        state._pending_attack_record = record
 
     elif isinstance(msg, MsgPosChange):
         p = state.players[msg.player]
@@ -205,6 +228,17 @@ def update_state(state: GameState, msg: ParsedMessage) -> None:
     elif isinstance(msg, MsgWin):
         state.winner = msg.player
         state.is_finished = True
+
+    # B1: Handle chain resolution events via msg_type
+    elif hasattr(msg, 'msg_type'):
+        if msg.msg_type == MSG.CHAIN_END:
+            state._pending_attack_record = None
+        elif msg.msg_type == MSG.CHAIN_NEGATED:
+            # Mark the last activate record as negated
+            for rec in reversed(state.action_history):
+                if rec.action_type == "activate":
+                    rec.extra_info["was_negated"] = True
+                    break
 
 
 def _handle_move(state: GameState, msg: MsgMove) -> None:
@@ -247,14 +281,23 @@ def _handle_move(state: GameState, msg: MsgMove) -> None:
         state.players[tp].hand.append(code & 0x7FFFFFFF)
     elif tl & LOCATION.MZONE and 0 <= ts < 5:
         state.players[tp].monsters[ts] = ZoneCard(
-            code=code, position=tpos, controller=tp, sequence=ts
+            code=code, position=tpos, controller=tp, sequence=ts,
+            set_turn=state.current_turn,
         )
     elif tl & LOCATION.SZONE and 0 <= ts < 5:
         state.players[tp].spells[ts] = ZoneCard(
-            code=code, position=tpos, controller=tp, sequence=ts
+            code=code, position=tpos, controller=tp, sequence=ts,
+            set_turn=state.current_turn,
         )
     elif tl & LOCATION.GRAVE:
         state.players[tp].graveyard.append(code)
+        # B1: Track destruction — field → grave counts as destroyed
+        if fl & (LOCATION.MZONE | LOCATION.SZONE):
+            # Attribute to most recent activate record in the chain
+            for rec in reversed(state.action_history):
+                if rec.action_type == "activate":
+                    rec.extra_info["destroyed"] = rec.extra_info.get("destroyed", 0) + 1
+                    break
     elif tl & LOCATION.REMOVED:
         state.players[tp].banished.append(code)
     elif tl & LOCATION.DECK:

@@ -29,10 +29,14 @@ Action layout:
 Total: 71 actions
 """
 
+import logging
 import struct
 from typing import Optional
 
 import numpy as np
+
+_logger = logging.getLogger("duelist_zero.action_space")
+_overflow_warned: set[str] = set()  # Track which overflow types we've warned about
 
 from ..core.constants import LOCATION, POSITION, MSG
 from ..core.message_parser import (
@@ -100,6 +104,21 @@ class ActionSpace:
         mask = np.zeros(ACTION_DIM, dtype=bool)
 
         if isinstance(msg, MsgSelectIdleCmd):
+            # Warn on overflow (first time per type)
+            for label, lst, cap in [
+                ("summon", msg.summonable, 5),
+                ("spsummon", msg.spsummonable, 5),
+                ("set_monster", msg.setable_monsters, 5),
+                ("set_st", msg.setable_st, 5),
+                ("activate", msg.activatable, 10),
+                ("reposition", msg.repositionable, 5),
+            ]:
+                if len(lst) > cap and label not in _overflow_warned:
+                    _overflow_warned.add(label)
+                    _logger.warning(
+                        "Action overflow: %s has %d options, capped at %d "
+                        "(%d dropped)", label, len(lst), cap, len(lst) - cap
+                    )
             # Summon
             for i, _ in enumerate(msg.summonable[:5]):
                 mask[_IDLE_SUMMON_START + i] = True

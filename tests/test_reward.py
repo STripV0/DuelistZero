@@ -1,5 +1,7 @@
 """Tests for the reward function including PBRS shaping."""
+from unittest.mock import MagicMock
 
+from duelist_zero.core.constants import POSITION
 from duelist_zero.engine.game_state import GameState, PlayerState, ZoneCard
 from duelist_zero.env.reward import compute_reward, compute_potential
 
@@ -226,3 +228,72 @@ class TestPBRSShaping:
         # Should equal turn-scaled win reward
         expected = 1.0 - 0.7 * (10 - 5) / 15.0
         assert abs(r - expected) < 1e-6
+
+
+class TestATKWeightedPotential:
+    """A3: ATK-weighted hybrid potential tests."""
+
+    @staticmethod
+    def _mock_db(card_data: dict):
+        """Create a mock CardDB that returns card_data[code]."""
+        db = MagicMock()
+        db.get = lambda code: card_data.get(code & 0x7FFFFFFF)
+        return db
+
+    def test_tribute_2_weak_for_1_strong(self):
+        """Tributing 2×1000 ATK for 1×2800 ATK should increase potential."""
+        # Before: 2 weak monsters (1000 ATK each)
+        before = _make_state()
+        before.players[0].monsters[0] = ZoneCard(
+            code=100, position=POSITION.FACEUP_ATTACK, controller=0, sequence=0)
+        before.players[0].monsters[1] = ZoneCard(
+            code=100, position=POSITION.FACEUP_ATTACK, controller=0, sequence=1)
+
+        # After: 1 strong monster (2800 ATK)
+        after = _make_state()
+        after.players[0].monsters[0] = ZoneCard(
+            code=200, position=POSITION.FACEUP_ATTACK, controller=0, sequence=0)
+
+        db = self._mock_db({
+            100: {"type": 0x1, "level": 4, "attribute": 0x20, "atk": 1000, "def": 800},
+            200: {"type": 0x1, "level": 7, "attribute": 0x20, "atk": 2800, "def": 2300},
+        })
+
+        pot_before = compute_potential(before, 0, db=db)
+        pot_after = compute_potential(after, 0, db=db)
+        assert pot_after > pot_before, (
+            f"After tribute ({pot_after:.4f}) should be > before ({pot_before:.4f})"
+        )
+
+    def test_spell_draw_increases_potential(self):
+        """Drawing extra cards (Pot of Greed) should increase card_adv component."""
+        before = _make_state(agent_hand=4)
+        after = _make_state(agent_hand=6)  # drew 2 extra cards
+
+        # Without db, falls back to count-based
+        pot_before = compute_potential(before, 0)
+        pot_after = compute_potential(after, 0)
+        assert pot_after > pot_before
+
+    def test_db_none_fallback(self):
+        """Without db, should still work (count-based fallback)."""
+        state = _make_state(agent_monsters=3, opp_monsters=1)
+        p = compute_potential(state, 0, db=None)
+        assert p > 0.0
+
+    def test_symmetric_with_db(self):
+        """ATK-weighted potential from p0's view should negate p1's view."""
+        state = _make_state()
+        state.players[0].monsters[0] = ZoneCard(
+            code=100, position=POSITION.FACEUP_ATTACK, controller=0, sequence=0)
+        state.players[1].monsters[0] = ZoneCard(
+            code=200, position=POSITION.FACEUP_ATTACK, controller=1, sequence=0)
+
+        db = self._mock_db({
+            100: {"type": 0x1, "level": 4, "attribute": 0x20, "atk": 1800, "def": 1200},
+            200: {"type": 0x1, "level": 4, "attribute": 0x10, "atk": 1500, "def": 1000},
+        })
+
+        p0 = compute_potential(state, 0, db=db)
+        p1 = compute_potential(state, 1, db=db)
+        assert abs(p0 + p1) < 1e-6

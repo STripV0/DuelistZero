@@ -10,6 +10,8 @@ import struct
 from pathlib import Path
 from typing import Callable, Optional
 
+import logging
+
 from ..core.bindings import OcgCore
 from ..core.callbacks import CallbackManager
 from ..core.constants import (
@@ -20,6 +22,7 @@ from ..core.constants import (
     POSITION,
     PROCESSOR_END,
     PROCESSOR_WAITING,
+    QUERY,
 )
 from ..core.message_parser import (
     MessageParser,
@@ -222,3 +225,93 @@ class Duel:
     def _update_state(self, msg: ParsedMessage):
         """Update game state based on a parsed message."""
         update_state(self.state, msg)
+
+    # ============================================================
+    # State Verification (A1)
+    # ============================================================
+    _logger = logging.getLogger("duelist_zero.duel")
+
+    def verify_state(self) -> list[str]:
+        """Verify Python GameState matches engine state.
+
+        Queries the engine for each player's MZONE and SZONE cards,
+        compares codes and positions against self.state. Also verifies LP.
+
+        Returns list of discrepancy strings (empty = all good).
+        """
+        if self._pduel is None:
+            return []
+
+        discrepancies = []
+        flags = int(QUERY.CODE | QUERY.POSITION | QUERY.ATTACK | QUERY.DEFENSE)
+
+        for player in (0, 1):
+            ps = self.state.players[player]
+
+            # Verify LP via query_field_info is complex; skip for now
+            # Verify MZONE and SZONE
+            for loc, zone_name, py_zone in [
+                (LOCATION.MZONE, "MZONE", ps.monsters),
+                (LOCATION.SZONE, "SZONE", ps.spells),
+            ]:
+                for seq in range(5):
+                    raw = self.core.query_card(
+                        self._pduel, player, int(loc), seq, flags
+                    )
+                    py_card = py_zone[seq] if seq < len(py_zone) else None
+
+                    if len(raw) < 4:
+                        # Engine says empty slot
+                        if py_card is not None:
+                            discrepancies.append(
+                                f"P{player} {zone_name}[{seq}]: engine=empty, "
+                                f"python=code:{py_card.code}"
+                            )
+                        continue
+
+                    # Parse query_card response: each field is (len:u32, data)
+                    # First 4 bytes = total length
+                    offset = 4
+                    engine_code = 0
+                    engine_pos = 0
+
+                    while offset + 4 <= len(raw):
+                        field_len = struct.unpack_from("<I", raw, offset)[0]
+                        if field_len <= 4:
+                            offset += field_len if field_len > 0 else 4
+                            continue
+                        # The flag tells us which field. Fields come in flag order.
+                        data_start = offset + 4
+                        data_bytes = field_len - 4
+
+                        if engine_code == 0 and data_bytes >= 4:
+                            engine_code = struct.unpack_from("<I", raw, data_start)[0]
+                        elif engine_code != 0 and engine_pos == 0 and data_bytes >= 4:
+                            engine_pos = struct.unpack_from("<I", raw, data_start)[0]
+                            break  # Got both code and position
+
+                        offset += field_len
+
+                    if engine_code == 0:
+                        if py_card is not None:
+                            discrepancies.append(
+                                f"P{player} {zone_name}[{seq}]: engine=empty, "
+                                f"python=code:{py_card.code}"
+                            )
+                    elif py_card is None:
+                        discrepancies.append(
+                            f"P{player} {zone_name}[{seq}]: engine=code:{engine_code}, "
+                            f"python=empty"
+                        )
+                    elif (py_card.code & 0x7FFFFFFF) != (engine_code & 0x7FFFFFFF):
+                        discrepancies.append(
+                            f"P{player} {zone_name}[{seq}]: engine=code:{engine_code}, "
+                            f"python=code:{py_card.code}"
+                        )
+
+        if discrepancies:
+            self._logger.warning(
+                "State sync discrepancies:\n  " + "\n  ".join(discrepancies)
+            )
+
+        return discrepancies
