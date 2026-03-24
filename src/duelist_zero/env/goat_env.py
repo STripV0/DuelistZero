@@ -53,11 +53,22 @@ from ..core.message_parser import (
 from ..engine.duel import Duel, load_deck
 from ..engine.game_state import GameState
 from .observation import (
-    encode_observation, encode_card_ids, encode_action_features, encode_action_history,
     CardDB, OBSERVATION_DIM, CARD_ID_DIM,
     ACTION_FEATURES_SLOTS, ACTION_FEATURES_DIM,
     HISTORY_LENGTH, HISTORY_FEATURES_DIM,
 )
+try:
+    from .fast_obs import (
+        encode_observation_fast as encode_observation,
+        encode_card_ids_fast as encode_card_ids,
+        encode_action_features_fast as encode_action_features,
+        encode_action_history_fast as encode_action_history,
+    )
+except ImportError:
+    from .observation import (
+        encode_observation, encode_card_ids,
+        encode_action_features, encode_action_history,
+    )
 from .card_index import CardIndex
 from .action_space import ActionSpace, ACTION_DIM, _respond_select_place
 from .reward import compute_reward, compute_potential
@@ -332,10 +343,14 @@ class GoatEnv(gym.Env):
         # Initialize PBRS potential
         if self._shaping_scale > 0 and self._duel is not None:
             self._prev_potential = compute_potential(
-                self._duel.state, self._agent_player
+                self._duel.state, self._agent_player, db=self._card_db
             )
         else:
             self._prev_potential = 0.0
+
+        # A1: Debug-mode state verification
+        if __debug__ and self._duel is not None:
+            self._duel.verify_state()
 
         obs = self._get_obs()
         info = self._get_info()
@@ -384,6 +399,10 @@ class GoatEnv(gym.Env):
         # Advance until next agent decision or game end
         self._pending_msg = self._advance()
 
+        # A1: Debug-mode state verification
+        if __debug__ and self._duel is not None and not self._duel.state.is_finished:
+            self._duel.verify_state()
+
         return self._finish_step()
 
     def _finish_step(self) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
@@ -394,7 +413,7 @@ class GoatEnv(gym.Env):
 
         # Compute PBRS
         if self._shaping_scale > 0 and not terminated and not truncated:
-            curr_potential = compute_potential(state, self._agent_player)
+            curr_potential = compute_potential(state, self._agent_player, db=self._card_db)
         else:
             curr_potential = 0.0  # terminal/truncated: absorbing state
 
@@ -750,6 +769,8 @@ class GoatEnv(gym.Env):
                     msg,
                     self._card_index,
                     db=self._card_db,
+                    perspective=opp_perspective,
+                    state=duel.state,
                 ),
                 "action_history": encode_action_history(
                     duel.state,
@@ -806,6 +827,8 @@ class GoatEnv(gym.Env):
                 self._pending_msg,
                 self._card_index,
                 db=self._card_db,
+                perspective=self._agent_player,
+                state=self._duel.state,
             ),
             "action_history": encode_action_history(
                 self._duel.state,

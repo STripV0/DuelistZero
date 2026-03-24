@@ -60,15 +60,15 @@ class DuelProxy:
         self.response = data
 
     def respond_card_selection(self, indices: list[int]):
-        # EDOPro's ygopro-core fork reads responses as int32 arrays:
-        #   returns[0] = type (3 = legacy byte format)
-        #   returns[1] = count
-        #   returns[2..] = indices
-        # Use type=0 (uint32 encoding) for compatibility
-        self.response = struct.pack("<i", 0)  # type = 0 (uint32)
-        self.response += struct.pack("<I", len(indices))  # count
+        # EDOPro's ygopro-core fork uses int32 response format:
+        #   returns[0] = type (int32): 0=uint32 indices
+        #   returns[1] = count (uint32)
+        #   returns[2..] = indices (uint32 each)
+        buf = struct.pack("<i", 0)  # type = 0 (uint32 encoding)
+        buf += struct.pack("<I", len(indices))  # count
         for idx in indices:
-            self.response += struct.pack("<I", idx)  # each index as uint32
+            buf += struct.pack("<I", idx)
+        self.response = buf
 
 
 class EdoProBot:
@@ -258,6 +258,14 @@ class EdoProBot:
 
     def _respond_to_decision(self, msg: ParsedMessage):
         """Use the model to decide and send a response."""
+        from ..core.constants import MSG
+
+        # SORT_CARD / SORT_CHAIN: respond with -1 to let engine auto-sort
+        if hasattr(msg, 'msg_type') and msg.msg_type in (MSG.SORT_CARD, MSG.SORT_CHAIN):
+            send_packet(self.sock, CTOS_RESPONSE, struct.pack("<i", -1))
+            print(f"    -> Auto-sort for {msg.msg_type.name}")
+            return
+
         try:
             # Compute observation from our perspective
             if self._dict_obs:
@@ -269,7 +277,8 @@ class EdoProBot:
                         self.state, perspective=self.my_player, card_index=self.card_index
                     ),
                     "action_features": encode_action_features(
-                        msg, self.card_index, db=self.card_db
+                        msg, self.card_index, db=self.card_db,
+                        perspective=self.my_player, state=self.state,
                     ),
                     "action_history": encode_action_history(
                         self.state, perspective=self.my_player,
