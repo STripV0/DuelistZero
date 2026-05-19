@@ -73,9 +73,9 @@ class SelfPlayCallback(BaseCallback):
             for p in existing:
                 ckpt_id = p.stem
                 self.pool.append((p.with_suffix(""), ckpt_id))
-            # Fast-forward next checkpoint step past existing ones
-            last_step = int(self.pool[-1][1].split("_")[1])
-            self._next_checkpoint_step = last_step + self.checkpoint_interval
+            # On resume, num_timesteps resets to 0, so schedule first
+            # checkpoint early rather than waiting for the old step count
+            self._next_checkpoint_step = self.checkpoint_interval
             # Activate self-play if we already have enough checkpoints
             if len(self.pool) >= 2 and not self.no_self_play:
                 self._self_play_active = True

@@ -19,10 +19,11 @@ data/script/
 
 # Training artifacts
 checkpoints/
+checkpoints_*/
 logs/
 runs/
 *.onnx
-training.log
+training*.log
 
 # OS
 .DS_Store
